@@ -1292,6 +1292,14 @@ def fcuda_flush_denormals_to_zero : Flag<["-"], "fcuda-flush-denormals-to-zero">
   Alias<fgpu_flush_denormals_to_zero>;
 def fno_cuda_flush_denormals_to_zero : Flag<["-"], "fno-cuda-flush-denormals-to-zero">,
   Alias<fno_gpu_flush_denormals_to_zero>;
+def fcuda_args_profile : Flag<["-"], "fcuda-args-profile">, Group<cuda_Group>,
+  Visibility<[ClangOption, CC1Option]>,
+  HelpText<"Enable profiling of CUDA kernel launch arguments">,
+  MarshallingInfoFlag<CodeGenOpts<"CudaArgsProfile">>;
+def fno_cuda_args_profile : Flag<["-"], "fno-cuda-args-profile">, Group<cuda_Group>,
+  Visibility<[ClangOption, CC1Option]>,
+  HelpText<"Disable profiling of CUDA kernel launch arguments">,
+  MarshallingInfoNegativeFlag<CodeGenOpts<"CudaArgsProfile">>;
 def : Flag<["-"], "fcuda-rdc">, Alias<fgpu_rdc>;
 def : Flag<["-"], "fno-cuda-rdc">, Alias<fno_gpu_rdc>;
 defm cuda_short_ptr : BoolFOption<"cuda-short-ptr",
