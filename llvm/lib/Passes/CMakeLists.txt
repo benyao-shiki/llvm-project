@@ -22,6 +22,7 @@ add_llvm_component_library(LLVMPasses
   GlobalISel
   Core
   Coroutines
+  CudaKernelNoalias
   HipStdPar
   IPO
   InstCombine

@@ -56,6 +56,7 @@
 #include "llvm/TargetParser/SubtargetFeature.h"
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/HipStdPar/HipStdPar.h"
+#include "llvm/Transforms/CudaKernelNoalias/CudaKernelNoalias.h"
 #include "llvm/Transforms/IPO/EmbedBitcodePass.h"
 #include "llvm/Transforms/IPO/LowerTypeTests.h"
 #include "llvm/Transforms/IPO/ThinLTOBitcodeWriter.h"
@@ -1107,6 +1108,14 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
         MPM.addPass(createModuleToFunctionPassAdaptor(MemProfilerPass()));
         MPM.addPass(ModuleMemProfilerPass());
       });
+    }
+
+    // Handle CUDA kernel noalias optimization.
+    if (CodeGenOpts.CudaKernelNoalias) {
+      PB.registerPipelineStartEPCallback(
+          [&](ModulePassManager &MPM, OptimizationLevel Level) {
+            MPM.addPass(CudaKernelNoaliasPass());
+          });
     }
 
     if (CodeGenOpts.FatLTO) {

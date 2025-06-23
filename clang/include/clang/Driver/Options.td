@@ -1292,6 +1292,13 @@ def fcuda_flush_denormals_to_zero : Flag<["-"], "fcuda-flush-denormals-to-zero">
   Alias<fgpu_flush_denormals_to_zero>;
 def fno_cuda_flush_denormals_to_zero : Flag<["-"], "fno-cuda-flush-denormals-to-zero">,
   Alias<fno_gpu_flush_denormals_to_zero>;
+def fcuda_kernel_noalias : Flag<["-"], "fcuda-kernel-noalias">, Group<cuda_Group>,
+  Visibility<[ClangOption, CC1Option]>,
+  HelpText<"Enable CUDA kernel noalias optimization">,
+  MarshallingInfoFlag<CodeGenOpts<"CudaKernelNoalias">>;
+def fno_cuda_kernel_noalias : Flag<["-"], "fno-cuda-kernel-noalias">, Group<cuda_Group>,
+  Visibility<[ClangOption, CC1Option]>,
+  HelpText<"Disable CUDA kernel noalias optimization">;
 def : Flag<["-"], "fcuda-rdc">, Alias<fgpu_rdc>;
 def : Flag<["-"], "fno-cuda-rdc">, Alias<fno_gpu_rdc>;
 defm cuda_short_ptr : BoolFOption<"cuda-short-ptr",

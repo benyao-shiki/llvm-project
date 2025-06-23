@@ -863,6 +863,10 @@ void CudaToolChain::addClangTargetOptions(
                          options::OPT_fno_cuda_short_ptr, false))
     CC1Args.append({"-mllvm", "--nvptx-short-ptr"});
 
+  if (DriverArgs.hasFlag(options::OPT_fcuda_kernel_noalias,
+                         options::OPT_fno_cuda_kernel_noalias, false))
+    CC1Args.push_back("-fcuda-kernel-noalias");
+
   if (!DriverArgs.hasFlag(options::OPT_offloadlib, options::OPT_no_offloadlib,
                           true))
     return;
