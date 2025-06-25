@@ -1112,8 +1112,8 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
 
     // Handle CUDA kernel noalias optimization.
     if (CodeGenOpts.CudaKernelNoalias) {
-      PB.registerPipelineStartEPCallback(
-          [&](ModulePassManager &MPM, OptimizationLevel Level) {
+      PB.registerPipelineEarlySimplificationEPCallback(
+          [&](ModulePassManager &MPM, OptimizationLevel Level, ThinOrFullLTOPhase Phase) {
             MPM.addPass(CudaKernelNoaliasPass());
           });
     }

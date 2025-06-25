@@ -142,6 +142,7 @@ private:
                                        FunctionArgList &Args);
   void emitDeviceStubBodyLegacy(CodeGenFunction &CGF, FunctionArgList &Args);
   void emitDeviceStubBodyNew(CodeGenFunction &CGF, FunctionArgList &Args);
+  void emitNoaliasDeviceStub(CodeGenFunction &CGF, FunctionArgList &Args);
   std::string getDeviceSideName(const NamedDecl *ND) override;
 
   void registerDeviceVar(const VarDecl *VD, llvm::GlobalVariable &Var,
@@ -308,19 +309,37 @@ std::string CGNVCUDARuntime::getDeviceSideName(const NamedDecl *ND) {
 
 void CGNVCUDARuntime::emitDeviceStub(CodeGenFunction &CGF,
                                      FunctionArgList &Args) {
+  // Add to EmittedKernels first
   EmittedKernels.push_back({CGF.CurFn, CGF.CurFuncDecl});
   if (auto *GV =
           dyn_cast<llvm::GlobalVariable>(KernelHandles[CGF.CurFn->getName()])) {
     GV->setLinkage(CGF.CurFn->getLinkage());
     GV->setInitializer(CGF.CurFn);
   }
-  if (CudaFeatureEnabled(CGM.getTarget().getSDKVersion(),
-                         CudaFeature::CUDA_USES_NEW_LAUNCH) ||
-      (CGF.getLangOpts().HIP && CGF.getLangOpts().HIPUseNewLaunchAPI) ||
-      (CGF.getLangOpts().OffloadViaLLVM))
-    emitDeviceStubBodyNew(CGF, Args);
-  else
-    emitDeviceStubBodyLegacy(CGF, Args);
+  
+  // Check if noalias optimization is enabled and kernel has pointer parameters
+  bool hasPointerParams = false;
+  for (const auto &Arg : Args) {
+    if (Arg->getType()->isPointerType()) {
+      hasPointerParams = true;
+      break;  
+    }
+  }
+  
+  // If noalias optimization is enabled and kernel has pointer parameters,
+  // generate noalias stub instead of normal stub
+  if (CGM.getCodeGenOpts().CudaKernelNoalias && hasPointerParams) {
+    emitNoaliasDeviceStub(CGF, Args);
+  } else {
+    // Generate normal stub
+    if (CudaFeatureEnabled(CGM.getTarget().getSDKVersion(),
+                           CudaFeature::CUDA_USES_NEW_LAUNCH) ||
+        (CGF.getLangOpts().HIP && CGF.getLangOpts().HIPUseNewLaunchAPI) ||
+        (CGF.getLangOpts().OffloadViaLLVM))
+      emitDeviceStubBodyNew(CGF, Args);
+    else
+      emitDeviceStubBodyLegacy(CGF, Args);
+  }
 }
 
 /// CUDA passes the arguments with a level of indirection. For example, a
@@ -546,6 +565,30 @@ void CGNVCUDARuntime::emitDeviceStubBodyLegacy(CodeGenFunction &CGF,
   CGF.EmitBlock(EndBlock);
 }
 
+void CGNVCUDARuntime::emitNoaliasDeviceStub(CodeGenFunction &CGF,
+                                            FunctionArgList &Args) {
+  // Generate the stub body directly in the current function (CGF.CurFn)
+  // The key is to ensure that the kernel handle points to the noalias device kernel
+  
+  // Modify the kernel handle to point to the noalias device kernel
+  // We need to update the KernelHandles mapping to use the noalias device kernel name
+  std::string OriginalKernelName = getDeviceSideName(cast<NamedDecl>(CGF.CurFuncDecl));
+  std::string NoaliasKernelName = OriginalKernelName + "_noalias";
+  
+  // The kernel handle should be the current stub function itself
+  // When cudaLaunchKernel is called with this handle, it will look up the noalias device kernel
+  KernelHandles[CGF.CurFn->getName()] = CGF.CurFn;
+  
+  // Generate the same kernel launch logic as normal stub
+  if (CudaFeatureEnabled(CGM.getTarget().getSDKVersion(),
+                         CudaFeature::CUDA_USES_NEW_LAUNCH) ||
+      (CGF.getLangOpts().HIP && CGF.getLangOpts().HIPUseNewLaunchAPI) ||
+      (CGF.getLangOpts().OffloadViaLLVM))
+    emitDeviceStubBodyNew(CGF, Args);
+  else
+    emitDeviceStubBodyLegacy(CGF, Args);
+}
+
 // Replace the original variable Var with the address loaded from variable
 // ManagedVar populated by HIP runtime.
 static void replaceManagedVar(llvm::GlobalVariable *Var,
@@ -629,12 +672,33 @@ llvm::Function *CGNVCUDARuntime::makeRegisterGlobalsFn() {
   // each emitted kernel.
   llvm::Argument &GpuBinaryHandlePtr = *RegisterKernelsFunc->arg_begin();
   for (auto &&I : EmittedKernels) {
-    llvm::Constant *KernelName =
-        makeConstantString(getDeviceSideName(cast<NamedDecl>(I.D)));
+    std::string DeviceKernelName = getDeviceSideName(cast<NamedDecl>(I.D));
+    
+    // If this kernel was generated with noalias optimization, we need to register it
+    // with the noalias device kernel name
+    if (CGM.getCodeGenOpts().CudaKernelNoalias) {
+      // Check if this kernel has pointer parameters
+      bool hasPointerParams = false;
+      if (const FunctionDecl *FD = cast<FunctionDecl>(I.D)) {
+        for (const ParmVarDecl *Param : FD->parameters()) {
+          if (Param->getType()->isPointerType()) {
+            hasPointerParams = true;
+            break;
+          }
+        }
+      }
+      if (hasPointerParams) {
+        DeviceKernelName += "_noalias";
+      }
+    }
+    
+    llvm::Constant *KernelName = makeConstantString(DeviceKernelName);
     llvm::Constant *NullPtr = llvm::ConstantPointerNull::get(PtrTy);
+    llvm::Value *KernelHandle = KernelHandles[I.Kernel->getName()];
+    
     llvm::Value *Args[] = {
         &GpuBinaryHandlePtr,
-        KernelHandles[I.Kernel->getName()],
+        KernelHandle,
         KernelName,
         KernelName,
         llvm::ConstantInt::get(IntTy, -1),
