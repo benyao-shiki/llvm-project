@@ -14,6 +14,8 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <math.h>
+#include <stdbool.h>
 
 // Global file handle for output
 static FILE *profile_file = NULL;
@@ -89,46 +91,83 @@ int is_likely_scalar(void* ptr) {
     return 0; // Default to not scalar
 }
 
-// Profile scalar argument with improved detection
-void profile_scalar_arg(const char* arg_name, void* value_ptr, int arg_index, int unused) {
+// Profile scalar argument with enhanced universal detection
+void profile_scalar_arg(const char* arg_name, void* value_ptr, int arg_index, int type_info) {
     init_cuda_profiling();
     
     if (!value_ptr) {
-        return; // Skip NULL values
-    }
-    
-    // Try to read the value safely
-    // value_ptr points to the argument in the args array
-    // For scalars, we need to read the actual value, not dereference as pointer
-    
-    // Try different scalar sizes
-    // Most CUDA scalars are 4 or 8 bytes
-    
-    // Try as 32-bit integer first
-    int32_t int_val = *(int32_t*)value_ptr;
-    
-    // Simple heuristic: if it's a small value, likely a scalar
-    if (int_val >= -1000000 && int_val <= 1000000) {
-        fprintf(profile_file, "  Scalar Argument: %s = %d\n", arg_name, int_val);
+        fprintf(profile_file, "  Argument %d (%s): NULL\n", arg_index, arg_name);
         fflush(profile_file);
         return;
     }
     
-    // Try as float
-    float float_val = *(float*)value_ptr;
-    if (float_val > -1000000.0f && float_val < 1000000.0f && 
-        (float_val > 0.001f || float_val < -0.001f || float_val == 0.0f)) {
-        fprintf(profile_file, "  Scalar Argument: %s = %.6f\n", arg_name, float_val);
-        fflush(profile_file);
-        return;
+    fprintf(profile_file, "  Argument %d (%s): ", arg_index, arg_name);
+    
+    // 基于type_info的智能类型检测
+    if (type_info >= 1 && type_info <= 64) {
+        // 整数类型，type_info表示位宽
+        if (type_info <= 8) {
+            int8_t val = *(int8_t*)value_ptr;
+            fprintf(profile_file, "%d (int8)", val);
+        } else if (type_info <= 16) {
+            int16_t val = *(int16_t*)value_ptr;
+            fprintf(profile_file, "%d (int16)", val);
+        } else if (type_info <= 32) {
+            int32_t val = *(int32_t*)value_ptr;
+            fprintf(profile_file, "%d (int32)", val);
+        } else {
+            int64_t val = *(int64_t*)value_ptr;
+            fprintf(profile_file, "%ld (int64)", val);
+        }
+    } else if (type_info == 100) {
+        // 单精度浮点
+        float val = *(float*)value_ptr;
+        fprintf(profile_file, "%.6f (float)", val);
+    } else if (type_info == 200) {
+        // 双精度浮点
+        double val = *(double*)value_ptr;
+        fprintf(profile_file, "%.6f (double)", val);
+    } else {
+        // 未知类型，使用启发式方法
+        int32_t int_val = *(int32_t*)value_ptr;
+        float float_val = *(float*)value_ptr;
+        uint64_t ptr_val = *(uint64_t*)value_ptr;
+        
+        // 多种解释，让用户选择最合理的
+        bool printed_something = false;
+        
+        // 检查是否像整数
+        if (int_val >= -1000000 && int_val <= 1000000) {
+            fprintf(profile_file, "%d", int_val);
+            printed_something = true;
+        }
+        
+        // 检查是否像浮点数
+        if (float_val > -1000000.0f && float_val < 1000000.0f && 
+            (float_val > 0.0001f || float_val < -0.0001f || float_val == 0.0f) &&
+            !isnan(float_val) && !isinf(float_val)) {
+            if (printed_something) fprintf(profile_file, " | ");
+            fprintf(profile_file, "%.6f", float_val);
+            printed_something = true;
+        }
+        
+        // 检查是否像指针（但仍然输出，因为可能是大整数）
+        if (ptr_val > 0x10000 && ptr_val < 0x7FFFFFFFFFFF) {
+            if (printed_something) fprintf(profile_file, " | ");
+            fprintf(profile_file, "0x%lx", ptr_val);
+            printed_something = true;
+        }
+        
+        if (!printed_something) {
+            // 最后的fallback
+            fprintf(profile_file, "0x%08x", *(uint32_t*)value_ptr);
+        }
+        
+        fprintf(profile_file, " (auto-detected)");
     }
     
-    // If it looks like a pointer (large address), skip it
-    uintptr_t ptr_val = (uintptr_t)*(void**)value_ptr;
-    if (ptr_val > 0x1000) {
-        // This looks like a pointer, skip it
-        return;
-    }
+    fprintf(profile_file, "\n");
+    fflush(profile_file);
 }
 
 // Constructor/destructor for automatic initialization
