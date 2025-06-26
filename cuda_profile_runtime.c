@@ -150,12 +150,7 @@ void register_kernel_params(const char* kernel_name, int param_count,
     
     kernel_count++;
     
-    fprintf(profile_file, "[注册] Kernel: %s, 参数数量: %d\n", kernel_name, param_count);
-    for (int i = 0; i < param_count; i++) {
-        fprintf(profile_file, "  参数%d: %s (%s)\n", i, param_names[i], param_types[i]);
-    }
-    fprintf(profile_file, "\n");
-    fflush(profile_file);
+    // 不再输出注册信息，只在运行时输出kernel启动信息
 }
 
 // 查找kernel参数信息
