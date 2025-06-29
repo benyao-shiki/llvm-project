@@ -317,28 +317,27 @@ void CGNVCUDARuntime::emitDeviceStub(CodeGenFunction &CGF,
     GV->setInitializer(CGF.CurFn);
   }
   
-  // Check if noalias optimization is enabled and kernel has pointer parameters
-  bool hasPointerParams = false;
+  // Always generate the original stub
+  if (CudaFeatureEnabled(CGM.getTarget().getSDKVersion(),
+                         CudaFeature::CUDA_USES_NEW_LAUNCH) ||
+      (CGF.getLangOpts().HIP && CGF.getLangOpts().HIPUseNewLaunchAPI) ||
+      (CGF.getLangOpts().OffloadViaLLVM))
+    emitDeviceStubBodyNew(CGF, Args);
+  else
+    emitDeviceStubBodyLegacy(CGF, Args);
+  
+  // Check if we need to generate noalias version as well
+  unsigned pointerParamCount = 0;
   for (const auto &Arg : Args) {
     if (Arg->getType()->isPointerType()) {
-      hasPointerParams = true;
-      break;  
+      pointerParamCount++;
     }
   }
   
-  // If noalias optimization is enabled and kernel has pointer parameters,
-  // generate noalias stub instead of normal stub
-  if (CGM.getCodeGenOpts().CudaKernelNoalias && hasPointerParams) {
+  // If noalias optimization is enabled and kernel has 2+ pointer parameters,
+  // generate additional noalias stub
+  if (CGM.getCodeGenOpts().CudaKernelNoalias && pointerParamCount >= 2) {
     emitNoaliasDeviceStub(CGF, Args);
-  } else {
-    // Generate normal stub
-    if (CudaFeatureEnabled(CGM.getTarget().getSDKVersion(),
-                           CudaFeature::CUDA_USES_NEW_LAUNCH) ||
-        (CGF.getLangOpts().HIP && CGF.getLangOpts().HIPUseNewLaunchAPI) ||
-        (CGF.getLangOpts().OffloadViaLLVM))
-      emitDeviceStubBodyNew(CGF, Args);
-    else
-      emitDeviceStubBodyLegacy(CGF, Args);
   }
 }
 
@@ -567,26 +566,52 @@ void CGNVCUDARuntime::emitDeviceStubBodyLegacy(CodeGenFunction &CGF,
 
 void CGNVCUDARuntime::emitNoaliasDeviceStub(CodeGenFunction &CGF,
                                             FunctionArgList &Args) {
-  // Generate the stub body directly in the current function (CGF.CurFn)
-  // The key is to ensure that the kernel handle points to the noalias device kernel
+  // Create a new function for the noalias stub
+  std::string NoaliasStubName = CGF.CurFn->getName().str() + "_noalias";
+  llvm::FunctionType *FT = CGF.CurFn->getFunctionType();
+  llvm::Function *NoaliasStub = llvm::Function::Create(
+      FT, CGF.CurFn->getLinkage(), NoaliasStubName, CGM.getModule());
   
-  // Modify the kernel handle to point to the noalias device kernel
-  // We need to update the KernelHandles mapping to use the noalias device kernel name
-  std::string OriginalKernelName = getDeviceSideName(cast<NamedDecl>(CGF.CurFuncDecl));
-  std::string NoaliasKernelName = OriginalKernelName + "_noalias";
+  // Copy attributes from original function
+  NoaliasStub->copyAttributesFrom(CGF.CurFn);
   
-  // The kernel handle should be the current stub function itself
-  // When cudaLaunchKernel is called with this handle, it will look up the noalias device kernel
-  KernelHandles[CGF.CurFn->getName()] = CGF.CurFn;
+  // Set up kernel handle for noalias stub
+  KernelHandles[NoaliasStub->getName()] = NoaliasStub;
   
-  // Generate the same kernel launch logic as normal stub
-  if (CudaFeatureEnabled(CGM.getTarget().getSDKVersion(),
-                         CudaFeature::CUDA_USES_NEW_LAUNCH) ||
-      (CGF.getLangOpts().HIP && CGF.getLangOpts().HIPUseNewLaunchAPI) ||
-      (CGF.getLangOpts().OffloadViaLLVM))
-    emitDeviceStubBodyNew(CGF, Args);
-  else
-    emitDeviceStubBodyLegacy(CGF, Args);
+  // Generate the function body for noalias stub
+  {
+    CodeGenFunction NoaliasCGF(CGM);
+    FunctionArgList NoaliasArgs;
+    
+    // Copy argument list
+    for (const auto &Arg : Args) {
+      auto *NewArg = ParmVarDecl::Create(
+          CGM.getContext(), nullptr, Arg->getInnerLocStart(), Arg->getLocation(),
+          Arg->getIdentifier(), Arg->getType(), Arg->getTypeSourceInfo(),
+          Arg->getStorageClass(), nullptr);
+      NoaliasArgs.push_back(NewArg);
+    }
+    
+    // Start function generation
+    const CGFunctionInfo &FI = CGM.getTypes().arrangeBuiltinFunctionDeclaration(
+        CGM.getContext().VoidTy, NoaliasArgs);
+    NoaliasCGF.StartFunction(GlobalDecl(), CGM.getContext().VoidTy, NoaliasStub, FI,
+                            NoaliasArgs, SourceLocation(), SourceLocation());
+    
+    // Generate the same stub logic as the original
+    if (CudaFeatureEnabled(CGM.getTarget().getSDKVersion(),
+                           CudaFeature::CUDA_USES_NEW_LAUNCH) ||
+        (CGF.getLangOpts().HIP && CGF.getLangOpts().HIPUseNewLaunchAPI) ||
+        (CGF.getLangOpts().OffloadViaLLVM))
+      emitDeviceStubBodyNew(NoaliasCGF, NoaliasArgs);
+    else
+      emitDeviceStubBodyLegacy(NoaliasCGF, NoaliasArgs);
+    
+    NoaliasCGF.FinishFunction();
+  }
+  
+  // Register the noalias stub
+  EmittedKernels.push_back({NoaliasStub, CGF.CurFuncDecl});
 }
 
 // Replace the original variable Var with the address loaded from variable
