@@ -43,6 +43,7 @@ MODULE_ANALYSIS("verify", VerifierAnalysis())
   MODULE_ANALYSIS(NAME, CREATE_PASS)
 #endif
 MODULE_ALIAS_ANALYSIS("globals-aa", GlobalsAA())
+MODULE_ALIAS_ANALYSIS("interpaa", InterpAA())
 #undef MODULE_ALIAS_ANALYSIS
 #undef MODULE_ANALYSIS
 

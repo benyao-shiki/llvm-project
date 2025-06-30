@@ -93,6 +93,7 @@ add_llvm_component_library(LLVMAnalysis
   InstCount.cpp
   InstructionPrecedenceTracking.cpp
   InstructionSimplify.cpp
+  InterpAliasAnalysis.cpp
   InteractiveModelRunner.cpp
   KernelInfo.cpp
   LastRunTrackingAnalysis.cpp

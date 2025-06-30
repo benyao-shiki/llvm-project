@@ -131,6 +131,7 @@ LLVM_ABI void initializeGVNLegacyPassPass(PassRegistry &);
 LLVM_ABI void initializeGlobalMergeFuncPassWrapperPass(PassRegistry &);
 LLVM_ABI void initializeGlobalMergePass(PassRegistry &);
 LLVM_ABI void initializeGlobalsAAWrapperPassPass(PassRegistry &);
+LLVM_ABI void initializeInterpAAWrapperPassPass(PassRegistry &);
 LLVM_ABI void initializeHardwareLoopsLegacyPass(PassRegistry &);
 LLVM_ABI void initializeMIRProfileLoaderPassPass(PassRegistry &);
 LLVM_ABI void initializeIRSimilarityIdentifierWrapperPassPass(PassRegistry &);
@@ -339,6 +340,8 @@ LLVM_ABI void initializeWasmEHPreparePass(PassRegistry &);
 LLVM_ABI void initializeWinEHPreparePass(PassRegistry &);
 LLVM_ABI void initializeWriteBitcodePassPass(PassRegistry &);
 LLVM_ABI void initializeXRayInstrumentationLegacyPass(PassRegistry &);
+
+void initializeInterpAAWrapperPassPass(PassRegistry &);
 
 } // end namespace llvm
 

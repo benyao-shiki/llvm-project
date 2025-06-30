@@ -12,69 +12,24 @@
 #include "llvm/InitializePasses.h"
 #include "llvm/PassRegistry.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Analysis/InterpAliasAnalysis.h"
 #include <cstring>
 
 using namespace llvm;
 
 /// initializeAnalysis - Initialize all passes linked into the Analysis library.
 void llvm::initializeAnalysis(PassRegistry &Registry) {
-  initializeAssumptionCacheTrackerPass(Registry);
-  initializeBasicAAWrapperPassPass(Registry);
-  initializeBlockFrequencyInfoWrapperPassPass(Registry);
-  initializeBranchProbabilityInfoWrapperPassPass(Registry);
-  initializeCallGraphWrapperPassPass(Registry);
-  initializeCallGraphDOTPrinterPass(Registry);
-  initializeCallGraphViewerPass(Registry);
-  initializeCycleInfoWrapperPassPass(Registry);
-  initializeDXILMetadataAnalysisWrapperPassPass(Registry);
-  initializeDXILResourceWrapperPassPass(Registry);
-  initializeDXILResourceBindingWrapperPassPass(Registry);
-  initializeDXILResourceTypeWrapperPassPass(Registry);
-  initializeDXILResourceWrapperPassPass(Registry);
-  initializeDependenceAnalysisWrapperPassPass(Registry);
-  initializeDominanceFrontierWrapperPassPass(Registry);
-  initializeDomViewerWrapperPassPass(Registry);
-  initializeDomPrinterWrapperPassPass(Registry);
-  initializeDomOnlyViewerWrapperPassPass(Registry);
-  initializePostDomViewerWrapperPassPass(Registry);
-  initializeDomOnlyPrinterWrapperPassPass(Registry);
-  initializePostDomPrinterWrapperPassPass(Registry);
-  initializePostDomOnlyViewerWrapperPassPass(Registry);
-  initializePostDomOnlyPrinterWrapperPassPass(Registry);
   initializeAAResultsWrapperPassPass(Registry);
+  initializeBasicAAWrapperPassPass(Registry);
   initializeGlobalsAAWrapperPassPass(Registry);
-  initializeExternalAAWrapperPassPass(Registry);
-  initializeImmutableModuleSummaryIndexWrapperPassPass(Registry);
-  initializeIVUsersWrapperPassPass(Registry);
-  initializeIRSimilarityIdentifierWrapperPassPass(Registry);
-  initializeLazyBranchProbabilityInfoPassPass(Registry);
-  initializeLazyBFIPassPass(Registry);
-  initializeLazyBlockFrequencyInfoPassPass(Registry);
-  initializeLazyValueInfoWrapperPassPass(Registry);
-  initializeLoopInfoWrapperPassPass(Registry);
-  initializeMemoryDependenceWrapperPassPass(Registry);
-  initializeModuleSummaryIndexWrapperPassPass(Registry);
-  initializeOptimizationRemarkEmitterWrapperPassPass(Registry);
-  initializePhiValuesWrapperPassPass(Registry);
-  initializePostDominatorTreeWrapperPassPass(Registry);
-  initializeProfileSummaryInfoWrapperPassPass(Registry);
-  initializeRegionInfoPassPass(Registry);
-  initializeRegionViewerPass(Registry);
-  initializeRegionPrinterPass(Registry);
-  initializeRegionOnlyViewerPass(Registry);
-  initializeRegionOnlyPrinterPass(Registry);
-  initializeSCEVAAWrapperPassPass(Registry);
-  initializeScalarEvolutionWrapperPassPass(Registry);
-  initializeStackSafetyGlobalInfoWrapperPassPass(Registry);
-  initializeStackSafetyInfoWrapperPassPass(Registry);
-  initializeTargetLibraryInfoWrapperPassPass(Registry);
-  initializeTargetTransformInfoWrapperPassPass(Registry);
   initializeTypeBasedAAWrapperPassPass(Registry);
-  initializeScopedNoAliasAAWrapperPassPass(Registry);
-  initializeStaticDataProfileInfoWrapperPassPass(Registry);
-  initializeLCSSAVerificationPassPass(Registry);
-  initializeMemorySSAWrapperPassPass(Registry);
-  initializeUniformityInfoWrapperPassPass(Registry);
+  initializeInterpAAWrapperPassPass(Registry);
+}
+
+void llvm::initializeInterpAAWrapperPassPass(PassRegistry &Registry) {
+  PassInfo *PI = new PassInfo("Interprocedural Alias Analysis", "interpaa",
+                             &InterpAA::Key, nullptr, true, true);
+  Registry.registerPass(*PI, true);
 }
 
 LLVMBool LLVMVerifyModule(LLVMModuleRef M, LLVMVerifierFailureAction Action,
