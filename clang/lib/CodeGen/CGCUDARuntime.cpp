@@ -45,49 +45,65 @@ RValue CGCUDARuntime::EmitCUDAKernelCallExpr(CodeGenFunction &CGF,
     llvm::BasicBlock *useOriginalBlock = CGF.createBasicBlock("use_original");
     llvm::BasicBlock *afterKernelCallBlock = CGF.createBasicBlock("after_kernel_call");
     
-    // Generate runtime condition check
-    const CallExpr *CallE = cast<CallExpr>(E);
-    
     // Collect pointer arguments
     llvm::SmallVector<llvm::Value *, 4> ptrArgs;
-    for (unsigned i = 0; i < CallE->getNumArgs(); ++i) {
-      const Expr *Arg = CallE->getArg(i);
+    for (unsigned i = 0; i < E->getNumArgs(); ++i) {
+      const Expr *Arg = E->getArg(i);
       if (Arg->getType()->isPointerType()) {
         llvm::Value *argValue = CGF.EmitScalarExpr(Arg);
         ptrArgs.push_back(argValue);
       }
     }
     
-    // Runtime condition: if we have at least 2 pointer args AND first != second, use noalias
-    llvm::Value *condition;
+    // Use external check_ptr() hook to determine aliasing among all pointer
+    // arguments. The hook returns true when aliasing EXISTS and false when the
+    // pointers are provably independent. We therefore negate its result to get
+    // the condition for selecting the noalias version.
+
+    llvm::Value *noAliasCondition;
     if (ptrArgs.size() >= 2) {
-      // Compare first and second pointer addresses
-      llvm::Value *firstPtr = ptrArgs[0];
-      llvm::Value *secondPtr = ptrArgs[1];
-      
-      // Convert pointers to integers for comparison
-      llvm::Value *firstPtrInt = CGF.Builder.CreatePtrToInt(firstPtr, CGF.Int64Ty, "first_ptr_int");
-      llvm::Value *secondPtrInt = CGF.Builder.CreatePtrToInt(secondPtr, CGF.Int64Ty, "second_ptr_int");
-      
-      // Check if addresses are different (no aliasing)
-      condition = CGF.Builder.CreateICmpNE(firstPtrInt, secondPtrInt, "ptrs_different");
+      llvm::Type *IntTy = CGF.IntTy;               // "int" in C/IR (i32)
+
+      // Prototype: bool check_ptr(int num_ptrs, ...)
+      llvm::FunctionType *CheckPtrTy =
+          llvm::FunctionType::get(CGF.Builder.getInt1Ty(), {IntTy}, /*isVarArg=*/true);
+      llvm::FunctionCallee CheckPtrFn =
+          CGF.CGM.CreateRuntimeFunction(CheckPtrTy, "check_ptr");
+
+      llvm::SmallVector<llvm::Value *, 8> CheckArgs;
+      CheckArgs.push_back(
+          llvm::ConstantInt::get(IntTy, static_cast<unsigned>(ptrArgs.size())));
+
+      // Cast each argument to void* (i8* in LLVM IR) before passing.
+      for (llvm::Value *V : ptrArgs)
+        CheckArgs.push_back(CGF.Builder.CreateBitCast(V, CGF.CGM.Int8PtrTy));
+
+      llvm::CallBase *AliasCall =
+          CGF.EmitRuntimeCallOrInvoke(CheckPtrFn, CheckArgs);
+
+      // AliasCall == true  => aliasing exists  => use ORIGINAL kernel
+      // AliasCall == false => no aliasing      => use NOALIAS kernel
+      noAliasCondition = CGF.Builder.CreateNot(AliasCall, "noalias");
     } else {
-      // Less than 2 pointer args, don't use noalias
-      condition = CGF.Builder.getFalse();
+      // Fewer than two pointer parameters: conservatively assume aliasing and
+      // stick to the original kernel implementation.
+      noAliasCondition = llvm::ConstantInt::getFalse(CGF.Builder.getContext());
     }
-    CGF.Builder.CreateCondBr(condition, useNoaliasBlock, useOriginalBlock);
+
+    CGF.Builder.CreateCondBr(noAliasCondition, useNoaliasBlock,
+                             useOriginalBlock);
     
     // Noalias branch
     CGF.EmitBlock(useNoaliasBlock);
     // Call the noalias version of the stub function
-    if (const DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(CallE->getCallee())) {
+    if (const DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(E->getCallee())) {
       if (const FunctionDecl *CalledFD = dyn_cast<FunctionDecl>(DRE->getDecl())) {
         // Find the noalias version of the stub function
         std::string NoaliasStubName = CGF.CGM.getMangledName(GlobalDecl(CalledFD)).str() + "_noalias";
         if (llvm::Function *NoaliasStub = CGF.CGM.getModule().getFunction(NoaliasStubName)) {
           // Emit the call arguments
           CallArgList Args;
-          for (const Expr *Arg : CallE->arguments()) {
+          for (const Expr *Arg : E->arguments()) {
             Args.add(CGF.EmitAnyExpr(Arg), Arg->getType());
           }
           
