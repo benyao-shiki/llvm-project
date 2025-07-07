@@ -16,9 +16,96 @@
 #include "CGCall.h"
 #include "CodeGenFunction.h"
 #include "clang/AST/ExprCXX.h"
+#include "llvm/Support/JSON.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/ErrorOr.h"
+#include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/Twine.h"
+#include <cstdlib>
+#include <vector>
 
 using namespace clang;
 using namespace CodeGen;
+
+//===----------------------------------------------------------------------===//
+// Helper utilities for CUDA kernel profile parsing (shared with LLVM pass)
+//===----------------------------------------------------------------------===//
+
+namespace {
+struct KernelProfileInfo {
+  std::vector<unsigned> TargetPointerIndices; ///< Pointer parameter indices
+};
+
+static llvm::StringMap<KernelProfileInfo> KernelProfileMap;
+static bool KernelProfileLoaded = false;
+
+static void loadCudaKernelProfile(const CodeGenModule &CGM) {
+  if (KernelProfileLoaded)
+    return;
+  KernelProfileLoaded = true;
+
+  std::string ProfilePath;
+  // 1) Environment variable takes priority.
+  if (const char *Env = std::getenv("CUDA_KERNEL_PROFILE"))
+    ProfilePath = Env;
+
+  // 2) Fallback: scan backend options for "-cuda-kernel-profile=".
+  if (ProfilePath.empty()) {
+    for (const std::string &Opt : CGM.getCodeGenOpts().CommandLineArgs) {
+      llvm::StringRef S(Opt);
+      if (S.consume_front("-cuda-kernel-profile=")) {
+        ProfilePath = S.str();
+        break;
+      }
+    }
+  }
+
+  if (ProfilePath.empty())
+    return; // Silently give up – no profile info available.
+
+  llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> BufferOrErr =
+      llvm::MemoryBuffer::getFile(ProfilePath);
+  if (!BufferOrErr)
+    return;
+
+  llvm::StringRef Content = BufferOrErr.get()->getBuffer();
+  auto Parsed = llvm::json::parse(Content);
+  if (!Parsed)
+    return;
+
+  llvm::json::Object *RootObj = Parsed->getAsObject();
+  if (!RootObj)
+    return;
+
+  if (llvm::json::Array *HotKernels = RootObj->getArray("hot_kernels")) {
+    for (llvm::json::Value &HKVal : *HotKernels) {
+      llvm::json::Object *HKObj = HKVal.getAsObject();
+      if (!HKObj)
+        continue;
+      auto NameVal = HKObj->getString("name");
+      if (!NameVal)
+        continue;
+
+      KernelProfileInfo Info;
+      if (llvm::json::Array *NoaliasArr = HKObj->getArray("noalias_pointers")) {
+        for (llvm::json::Value &PtrVal : *NoaliasArr) {
+          llvm::json::Object *PtrObj = PtrVal.getAsObject();
+          if (!PtrObj)
+            continue;
+          auto ArgVal = PtrObj->get("arg");
+          if (!ArgVal)
+            continue;
+          if (auto ArgInt = ArgVal->getAsInteger())
+            Info.TargetPointerIndices.push_back(static_cast<unsigned>(*ArgInt));
+        }
+      }
+      if (!Info.TargetPointerIndices.empty())
+        KernelProfileMap[*NameVal] = std::move(Info);
+    }
+  }
+}
+} // end anonymous namespace
 
 CGCUDARuntime::~CGCUDARuntime() {}
 
@@ -40,81 +127,124 @@ RValue CGCUDARuntime::EmitCUDAKernelCallExpr(CodeGenFunction &CGF,
   const FunctionDecl *FD = dyn_cast<FunctionDecl>(E->getCalleeDecl());
   
   if (FD && CGF.CGM.getCodeGenOpts().CudaKernelNoalias) {
-    // Always generate runtime check when noalias is enabled
+    // Ensure profile has been parsed (only once per translation unit)
+    loadCudaKernelProfile(CGF.CGM);
+
+    // Retrieve mangled kernel name to match profile (device stub shares name)
+    std::string MangledName = CGF.CGM.getMangledName(GlobalDecl(FD)).str();
+    auto ProfileIt = KernelProfileMap.find(MangledName);
+
+    // If no profile information or no target pointers recorded, fall back.
+    if (ProfileIt == KernelProfileMap.end() ||
+        ProfileIt->second.TargetPointerIndices.empty()) {
+      CGF.EmitSimpleCallExpr(E, ReturnValue, CallOrInvoke);
+      CGF.EmitBranch(ContBlock);
+      CGF.EmitBlock(ContBlock);
+      eval.end(CGF);
+      return RValue::get(nullptr);
+    }
+
+    const std::vector<unsigned> &TargetIndices =
+        ProfileIt->second.TargetPointerIndices;
+
     llvm::BasicBlock *useNoaliasBlock = CGF.createBasicBlock("use_noalias");
     llvm::BasicBlock *useOriginalBlock = CGF.createBasicBlock("use_original");
-    llvm::BasicBlock *afterKernelCallBlock = CGF.createBasicBlock("after_kernel_call");
-    
-    // Collect pointer arguments
-    llvm::SmallVector<llvm::Value *, 4> ptrArgs;
+    llvm::BasicBlock *afterKernelCallBlock =
+        CGF.createBasicBlock("after_kernel_call");
+
+    // Separate pointer arguments into target set and other set.
+    llvm::SmallVector<llvm::Value *, 8> TargetPtrs;
+    llvm::SmallVector<llvm::Value *, 8> OtherPtrs;
+
     for (unsigned i = 0; i < E->getNumArgs(); ++i) {
       const Expr *Arg = E->getArg(i);
-      if (Arg->getType()->isPointerType()) {
-        llvm::Value *argValue = CGF.EmitScalarExpr(Arg);
-        ptrArgs.push_back(argValue);
-      }
+      if (!Arg->getType()->isPointerType())
+        continue;
+      llvm::Value *ArgVal = CGF.EmitScalarExpr(Arg);
+      if (llvm::is_contained(TargetIndices, i))
+        TargetPtrs.push_back(ArgVal);
+      else
+        OtherPtrs.push_back(ArgVal);
     }
-    
-    // Use external check_ptr() hook to determine aliasing among all pointer
-    // arguments. The hook returns true when aliasing EXISTS and false when the
-    // pointers are provably independent. We therefore negate its result to get
-    // the condition for selecting the noalias version.
 
-    llvm::Value *noAliasCondition;
-    if (ptrArgs.size() >= 2) {
-      llvm::Type *IntTy = CGF.IntTy;               // "int" in C/IR (i32)
+    // If there are fewer than one target or other pointers, assume aliasing.
+    llvm::Value *noAliasCondition = nullptr;
+    if (!TargetPtrs.empty() && !OtherPtrs.empty()) {
+      auto createPtrArray = [&](llvm::ArrayRef<llvm::Value *> Ptrs,
+                                const llvm::Twine &Name) -> llvm::Value * {
+        llvm::ArrayType *ArrTy =
+            llvm::ArrayType::get(CGF.CGM.Int8PtrTy, Ptrs.size());
+        llvm::AllocaInst *ArrAlloca =
+            CGF.Builder.CreateAlloca(ArrTy, nullptr, Name);
+        llvm::Value *Zero = llvm::ConstantInt::get(CGF.IntTy, 0);
+        for (unsigned idx = 0; idx < Ptrs.size(); ++idx) {
+          llvm::Value *CastPtr =
+              CGF.Builder.CreateBitCast(Ptrs[idx], CGF.CGM.Int8PtrTy);
+          llvm::Value *ElemPtr = CGF.Builder.CreateInBoundsGEP(
+              ArrTy, ArrAlloca,
+              {Zero, llvm::ConstantInt::get(CGF.IntTy, idx)});
+          CGF.Builder.CreateDefaultAlignedStore(CastPtr, ElemPtr);
+        }
+        llvm::Value *FirstElemPtr = CGF.Builder.CreateInBoundsGEP(
+            ArrTy, ArrAlloca, {Zero, Zero});
+        llvm::Type *Int8PtrPtrTy =
+            llvm::PointerType::getUnqual(CGF.CGM.Int8PtrTy);
+        return CGF.Builder.CreateBitCast(FirstElemPtr, Int8PtrPtrTy);
+      };
 
-      // Prototype: bool check_ptr(int num_ptrs, ...)
-      llvm::FunctionType *CheckPtrTy =
-          llvm::FunctionType::get(CGF.Builder.getInt1Ty(), {IntTy}, /*isVarArg=*/true);
+      llvm::Value *TargetsPtr = createPtrArray(TargetPtrs, "targets");
+      llvm::Value *OthersPtr = createPtrArray(OtherPtrs, "others");
+
+      llvm::Type *IntTy = CGF.IntTy; // i32
+      llvm::Type *Int8PtrPtrTy = llvm::PointerType::getUnqual(CGF.CGM.Int8PtrTy);
+
+      // bool check_ptr_sets(int, i8**, int, i8**)
+      llvm::FunctionType *CheckPtrTy = llvm::FunctionType::get(
+          CGF.Builder.getInt1Ty(), {IntTy, Int8PtrPtrTy, IntTy, Int8PtrPtrTy},
+          /*isVarArg=*/false);
       llvm::FunctionCallee CheckPtrFn =
-          CGF.CGM.CreateRuntimeFunction(CheckPtrTy, "check_ptr");
+          CGF.CGM.CreateRuntimeFunction(CheckPtrTy, "check_ptr_sets");
 
-      llvm::SmallVector<llvm::Value *, 8> CheckArgs;
-      CheckArgs.push_back(
-          llvm::ConstantInt::get(IntTy, static_cast<unsigned>(ptrArgs.size())));
+      llvm::Value *NumTargets =
+          llvm::ConstantInt::get(IntTy, TargetPtrs.size());
+      llvm::Value *NumOthers =
+          llvm::ConstantInt::get(IntTy, OtherPtrs.size());
 
-      // Cast each argument to void* (i8* in LLVM IR) before passing.
-      for (llvm::Value *V : ptrArgs)
-        CheckArgs.push_back(CGF.Builder.CreateBitCast(V, CGF.CGM.Int8PtrTy));
-
-      llvm::CallBase *AliasCall =
-          CGF.EmitRuntimeCallOrInvoke(CheckPtrFn, CheckArgs);
+      llvm::CallBase *AliasCall = CGF.EmitRuntimeCallOrInvoke(
+          CheckPtrFn, {NumTargets, TargetsPtr, NumOthers, OthersPtr});
 
       // AliasCall == true  => aliasing exists  => use ORIGINAL kernel
       // AliasCall == false => no aliasing      => use NOALIAS kernel
       noAliasCondition = CGF.Builder.CreateNot(AliasCall, "noalias");
     } else {
-      // Fewer than two pointer parameters: conservatively assume aliasing and
-      // stick to the original kernel implementation.
+      // Not enough pointers to justify runtime check – conservatively assume
+      // aliasing.
       noAliasCondition = llvm::ConstantInt::getFalse(CGF.Builder.getContext());
     }
 
     CGF.Builder.CreateCondBr(noAliasCondition, useNoaliasBlock,
                              useOriginalBlock);
-    
-    // Noalias branch
+
+    //===------------------------------------------------------------------===//
+    // Noalias branch – call the specialised stub with suffix "_noalias".
+    //===------------------------------------------------------------------===//
     CGF.EmitBlock(useNoaliasBlock);
-    // Call the noalias version of the stub function
     if (const DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(E->getCallee())) {
       if (const FunctionDecl *CalledFD = dyn_cast<FunctionDecl>(DRE->getDecl())) {
-        // Find the noalias version of the stub function
-        std::string NoaliasStubName = CGF.CGM.getMangledName(GlobalDecl(CalledFD)).str() + "_noalias";
-        if (llvm::Function *NoaliasStub = CGF.CGM.getModule().getFunction(NoaliasStubName)) {
-          // Emit the call arguments
+        std::string NoaliasStubName =
+            CGF.CGM.getMangledName(GlobalDecl(CalledFD)).str() + "_noalias";
+        if (llvm::Function *NoaliasStub =
+                CGF.CGM.getModule().getFunction(NoaliasStubName)) {
           CallArgList Args;
-          for (const Expr *Arg : E->arguments()) {
+          for (const Expr *Arg : E->arguments())
             Args.add(CGF.EmitAnyExpr(Arg), Arg->getType());
-          }
-          
-          // Create function info for the call
+
           const CGFunctionInfo &FnInfo = CGF.CGM.getTypes().arrangeFreeFunctionCall(
               Args, CalledFD->getType()->castAs<FunctionType>(), /*ChainCall=*/false);
-          
-          // Emit the call
-          CGF.EmitCall(FnInfo, CGCallee::forDirect(NoaliasStub), ReturnValueSlot(), Args);
+          CGF.EmitCall(FnInfo, CGCallee::forDirect(NoaliasStub), ReturnValueSlot(),
+                       Args);
         } else {
-          // Fallback to original call if noalias stub not found
+          // Fallback – noalias stub missing.
           CGF.EmitSimpleCallExpr(E, ReturnValue, CallOrInvoke);
         }
       } else {
@@ -124,12 +254,14 @@ RValue CGCUDARuntime::EmitCUDAKernelCallExpr(CodeGenFunction &CGF,
       CGF.EmitSimpleCallExpr(E, ReturnValue, CallOrInvoke);
     }
     CGF.EmitBranch(afterKernelCallBlock);
-    
-    // Original branch (unused in this case since condition is always true)
+
+    //===------------------------------------------------------------------===//
+    // Original branch
+    //===------------------------------------------------------------------===//
     CGF.EmitBlock(useOriginalBlock);
     CGF.EmitSimpleCallExpr(E, ReturnValue, CallOrInvoke);
     CGF.EmitBranch(afterKernelCallBlock);
-    
+
     CGF.EmitBlock(afterKernelCallBlock);
   } else {
     // No conditional logic needed, use original call
