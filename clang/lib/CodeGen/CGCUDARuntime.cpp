@@ -24,6 +24,7 @@
 #include "llvm/ADT/Twine.h"
 #include <cstdlib>
 #include <vector>
+#include <cstring>
 
 using namespace clang;
 using namespace CodeGen;
@@ -134,6 +135,22 @@ RValue CGCUDARuntime::EmitCUDAKernelCallExpr(CodeGenFunction &CGF,
     std::string MangledName = CGF.CGM.getMangledName(GlobalDecl(FD)).str();
     auto ProfileIt = KernelProfileMap.find(MangledName);
 
+    if (ProfileIt == KernelProfileMap.end()) {
+      // Try without the __device_stub__ prefix which Clang adds to host stubs.
+      llvm::StringRef NameRef(MangledName);
+      size_t StubPos = NameRef.find("__device_stub__");
+      if (StubPos != llvm::StringRef::npos) {
+        llvm::StringRef Suffix = NameRef.substr(StubPos + strlen("__device_stub__"));
+        // Try to find any kernel whose mangled name ends with the suffix.
+        for (auto It = KernelProfileMap.begin(); It != KernelProfileMap.end(); ++It) {
+          if (llvm::StringRef(It->getKey()).ends_with(Suffix)) {
+            ProfileIt = It;
+            break;
+          }
+        }
+      }
+    }
+
     // If no profile information or no target pointers recorded, fall back.
     if (ProfileIt == KernelProfileMap.end() ||
         ProfileIt->second.TargetPointerIndices.empty()) {
@@ -167,11 +184,15 @@ RValue CGCUDARuntime::EmitCUDAKernelCallExpr(CodeGenFunction &CGF,
         OtherPtrs.push_back(ArgVal);
     }
 
-    // If there are fewer than one target or other pointers, assume aliasing.
+    // Generate runtime alias check whenever there is at least one target pointer.
     llvm::Value *noAliasCondition = nullptr;
-    if (!TargetPtrs.empty() && !OtherPtrs.empty()) {
+    if (!TargetPtrs.empty()) {
       auto createPtrArray = [&](llvm::ArrayRef<llvm::Value *> Ptrs,
                                 const llvm::Twine &Name) -> llvm::Value * {
+        if (Ptrs.empty())
+          return llvm::ConstantPointerNull::get(
+              llvm::PointerType::getUnqual(CGF.CGM.Int8PtrTy));
+
         llvm::ArrayType *ArrTy =
             llvm::ArrayType::get(CGF.CGM.Int8PtrTy, Ptrs.size());
         llvm::AllocaInst *ArrAlloca =
@@ -207,8 +228,7 @@ RValue CGCUDARuntime::EmitCUDAKernelCallExpr(CodeGenFunction &CGF,
 
       llvm::Value *NumTargets =
           llvm::ConstantInt::get(IntTy, TargetPtrs.size());
-      llvm::Value *NumOthers =
-          llvm::ConstantInt::get(IntTy, OtherPtrs.size());
+      llvm::Value *NumOthers = llvm::ConstantInt::get(IntTy, OtherPtrs.size());
 
       llvm::CallBase *AliasCall = CGF.EmitRuntimeCallOrInvoke(
           CheckPtrFn, {NumTargets, TargetsPtr, NumOthers, OthersPtr});
@@ -217,8 +237,7 @@ RValue CGCUDARuntime::EmitCUDAKernelCallExpr(CodeGenFunction &CGF,
       // AliasCall == false => no aliasing      => use NOALIAS kernel
       noAliasCondition = CGF.Builder.CreateNot(AliasCall, "noalias");
     } else {
-      // Not enough pointers to justify runtime check – conservatively assume
-      // aliasing.
+      // No target pointer recorded – fall back conservatively.
       noAliasCondition = llvm::ConstantInt::getFalse(CGF.Builder.getContext());
     }
 
