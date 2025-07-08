@@ -41,19 +41,19 @@ using namespace llvm;
 
 #define DEBUG_TYPE "cuda-kernel-noalias"
 
-// 命令行选项
+// Command-line option for specifying the profile JSON file path
 static cl::opt<std::string> CudaProfilePath(
     "cuda-kernel-profile",
     cl::desc("Path to the CUDA kernel profile log file"),
     cl::value_desc("filename"),
     cl::init(""));
 
-// 判断是否为kernel函数
+// Return true if the given function is a PTX kernel entry
 static bool isKernelFunction(const Function &F) {
   return F.getCallingConv() == CallingConv::PTX_Kernel;
 }
 
-// 判断是否有NVVM kernel注解
+// Utility: check whether the function has an explicit NVVM "kernel" annotation
 static bool hasNVVMKernelAnnotation(const Function &F) {
   const Module *M = F.getParent();
   NamedMDNode *NMD = M->getNamedMetadata("nvvm.annotations");
@@ -77,7 +77,7 @@ static bool hasNVVMKernelAnnotation(const Function &F) {
   return false;
 }
 
-// 解析profile日志文件
+// Parse the JSON profile log and populate KernelProfiles
 bool CudaKernelNoaliasPass::parseProfileLog() {
   if (CudaProfilePath.empty()) {
     errs() << "Warning: No profile log file specified. Use -mllvm -cuda-kernel-profile=<file>\n";
@@ -106,7 +106,7 @@ bool CudaKernelNoaliasPass::parseProfileLog() {
   json::Array *HotKernels = RootObj->getArray("hot_kernels");
   if (!HotKernels) {
     errs() << "Warning: No hot_kernels array in profile log\n";
-    return true; // nothing to optimize
+    return true; // Nothing to optimize – no hot kernels present
   }
 
   for (json::Value &HKVal : *HotKernels) {
@@ -145,7 +145,7 @@ bool CudaKernelNoaliasPass::parseProfileLog() {
   return true;
 }
 
-// 获取可以添加noalias属性的指针参数索引
+// Return the parameter indices that should receive the noalias attribute
 std::vector<unsigned> CudaKernelNoaliasPass::getNoAliasPointerIndices(const Function &F) {
   std::vector<unsigned> NoAliasParams;
   auto It = KernelProfiles.find(F.getName().str());
@@ -165,18 +165,18 @@ static Function *cloneKernelWithNoalias(Function &OrigF,
   ValueToValueMapTy VMap;
   Function *ClonedF = CloneFunction(&OrigF, VMap);
   
-  // 设置新名称
+  // Set new function name for the cloned variant
   std::string NewName = OrigF.getName().str() + "_" + Suffix;
   ClonedF->setName(NewName);
   
-  // 为指定的参数添加noalias属性
+  // Add noalias attribute to the requested parameters
   for (unsigned Idx : NoaliasParams) {
     if (Idx < ClonedF->arg_size()) {
       ClonedF->addParamAttr(Idx, Attribute::NoAlias);
     }
   }
   
-  // 复制nvvm.annotations元数据
+  // Copy the existing nvvm.annotations entry so the clone is still a kernel
   Module *M = OrigF.getParent();
   NamedMDNode *NMD = M->getOrInsertNamedMetadata("nvvm.annotations");
   
@@ -215,18 +215,18 @@ PreservedAnalyses CudaKernelNoaliasPass::run(Module &M, ModuleAnalysisManager &A
   bool Changed = false;
   std::vector<Function *> KernelsToProcess;
   
-  // 识别所有kernel函数
+  // Collect all kernel functions in the module
   for (Function &F : M) {
     if (isKernelFunction(F)) {
       KernelsToProcess.push_back(&F);
     }
   }
   
-  // 处理每个kernel函数
+  // Process each kernel function
   for (Function *F : KernelsToProcess) {
     std::vector<unsigned> NoAliasParams = getNoAliasPointerIndices(*F);
     
-    // 如果有可以添加noalias的参数，创建优化版本
+    // Clone the kernel only when there is at least one parameter to mark
     if (!NoAliasParams.empty()) {
       std::string Suffix = "noalias";
       Function *ClonedF = cloneKernelWithNoalias(*F, NoAliasParams, Suffix);

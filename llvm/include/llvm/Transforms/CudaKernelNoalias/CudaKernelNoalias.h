@@ -21,12 +21,12 @@
 
 namespace llvm {
 
-// 存储指针参数的信息
+// Information for a pointer argument parsed from the profile log
 struct PointerInfo {
-  unsigned index; // 参数索引 (0-based)
+  unsigned index; // Argument index (0-based)
 };
 
-// 存储kernel的profile信息
+// Per-kernel profile information parsed from the JSON log
 struct KernelProfile {
   std::string name;
   std::vector<PointerInfo> pointerParams;
