@@ -1,168 +1,172 @@
-# CUDA Kernel Noalias Optimization
+# CUDA Kernel **Noalias** Optimization
 
-## 概述
+This document explains the design, build-time switches and run-time requirements for the *Kernel Noalias* optimisation implemented in the LLVM/Clang CUDA tool-chain contained in this repository.
 
-这是一个为LLVM/Clang添加的CUDA kernel优化功能，可以自动为具有多个指针参数的CUDA kernel函数创建带有noalias属性的克隆版本，从而允许编译器进行更积极的优化。
+---
 
-## 功能特性
+## 1. Motivation
 
-- 自动识别CUDA kernel函数
-- 为具有2个或更多指针参数的kernel创建noalias克隆版本
-- 通过编译器选项控制功能启用/禁用
-- 集成到标准CUDA编译流程中
+Many CUDA kernels receive several pointer parameters that are guaranteed **not** to alias each other.  If the compiler is aware of this property it can perform more aggressive memory-optimisations (LICM, vectorisation, memory coalescing, …).  Unfortunately the information is seldom available at compile time.
 
-## 实现详情
+The *Kernel Noalias* pipeline bridges that gap:
 
-### 1. LLVM Pass实现
-- **位置**: `llvm/lib/Transforms/CudaKernelNoalias/`
-- **核心文件**: `CudaKernelNoalias.cpp`, `CudaKernelNoalias.h`
-- **功能**: 
-  - 检测`CallingConv::PTX_Kernel`调用约定的函数
-  - 分析指针参数数量
-  - 为符合条件的kernel创建带有noalias属性的克隆函数
-  - 复制nvvm.annotations元数据
+1.  **profilers** a tool based on nvbit, which identify kernels and pointer arguments that never alias in practice and emit a JSON profile.
+2.  **LLVM pass** (`CudaKernelNoaliasPass`) clones each hot kernel, annotates the selected parameters with the `noalias` attribute and keeps the original version untouched.
+3.  **Clang front-end** (`CGCUDARuntime`) inserts a small run-time check in every launch site that dynamically chooses between the specialised *noalias* stub and the normal stub.
+4.  A hook func (`check_ptr_sets`) provides the alias ptr check at run time.
 
-### 2. 编译器选项
-- **选项定义**: `clang/include/clang/Driver/Options.td`
-- **选项**: `-fcuda-kernel-noalias` / `-fno-cuda-kernel-noalias`
-- **默认状态**: 禁用
+The result is a *fully automatic*, profile-guided optimisation that yields large speed-ups while being 100 % safe – when aliasing is detected we simply fall back to the unoptimised kernel.
 
-### 3. 集成点
-- **后端集成**: `clang/lib/CodeGen/BackendUtil.cpp`
-- **Driver传递**: `clang/lib/Driver/ToolChains/Clang.cpp`, `clang/lib/Driver/ToolChains/Cuda.cpp`
-- **Pass注册**: `llvm/lib/Passes/PassRegistry.def`, `llvm/lib/Passes/PassBuilder.cpp`
+---
 
-## 使用方法
+## 2. JSON profile format
 
-### 编译选项
-```bash
-# 启用CUDA kernel noalias优化
-clang++ -fcuda-kernel-noalias --cuda-gpu-arch=sm_XX source.cu -o output
+The optimiser consumes a single JSON file (e.g. `profile_test.json`).  A reduced example:
 
-# 禁用优化（默认）
-clang++ -fno-cuda-kernel-noalias --cuda-gpu-arch=sm_XX source.cu -o output
+```json
+      "name": "_Z11gemm_kerneliiiffPfS_S_",
+      "demangled_name": "gemm_kernel(int, int, int, float, float, float*, float*, float*)",
+      "launches": 1,
+      "common_scalars": [
+        {
+          "arg": 0,
+          "value": "512",
+          "ratio": 1
+        }
+      ],
+      "common_dims": [
+        {
+          "dim": "gridDim.x",
+          "value": 16,
+          "ratio": 1
+        }
+      ],
+      "noalias_pointers": [
+        {
+          "arg": 5,
+          "ratio": 1
+        },
+        {
+          "arg": 6,
+          "ratio": 1
+        },
+        {
+          "arg": 7,
+          "ratio": 1
+        }
+      ]
 ```
 
-### 示例代码
-```cuda
-// 这个kernel有3个指针参数，会创建noalias克隆版本
-__global__ void vector_add(float* a, float* b, float* c, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        c[idx] = a[idx] + b[idx];
-    }
-}
+Keys:
 
-// 这个kernel只有1个指针参数，不会创建克隆版本
-__global__ void fill_array(float* data, float value, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        data[idx] = value;
-    }
-}
-```
+*   `hot_kernels[]` – kernels that should be specialised.
+*   `name` – *device* side mangled name (same as shown in PTX / `nvcc --ptxas-options=-v`).
+*   `noalias_pointers[]` – list of pointer arguments (zero-based) that are known never to alias **any** other pointer argument of the same launch.
 
-## 验证方法
+If either the kernel is absent from the array or its list is empty, that kernel is left untouched.
 
-### 1. 检查生成的函数
-```bash
-# 编译程序
-clang++ -fcuda-kernel-noalias --cuda-gpu-arch=sm_52 test.cu -o test -lcudart
+---
 
-# 检查是否生成了noalias版本
-strings test | grep "_noalias$"
-```
+## 3. LLVM Pass – `CudaKernelNoaliasPass`
 
-预期输出：
-```
-_Z10vector_addPfS_S_i_noalias
-```
+Location: `llvm/lib/Transforms/CudaKernelNoalias/`.
 
-### 2. 查看LLVM IR
-```bash
-# 生成设备端IR
-clang++ -fcuda-kernel-noalias --cuda-gpu-arch=sm_52 --cuda-device-only -S -emit-llvm test.cu -o test.ll
-
-# 查看noalias属性
-grep -E "define.*noalias|ptr noalias" test.ll
-```
-
-预期输出：
-```
-define dso_local ptx_kernel void @_Z10vector_addPfS_S_i_noalias(ptr noalias noundef readonly %a, ptr noalias noundef readonly %b, ptr noalias noundef writeonly %c, i32 noundef %n)
-```
-
-### 3. 对比测试
-```bash
-# 启用优化版本
-clang++ -fcuda-kernel-noalias --cuda-gpu-arch=sm_52 test.cu -o test_enabled -lcudart
-strings test_enabled | grep -c "_noalias$"
-
-# 禁用优化版本  
-clang++ -fno-cuda-kernel-noalias --cuda-gpu-arch=sm_52 test.cu -o test_disabled -lcudart
-strings test_disabled | grep -c "_noalias$"
-```
-
-启用版本应该输出非零数量，禁用版本应该输出0。
-
-## 技术细节
-
-### Pass执行时机
-- 在设备端编译阶段执行
-- 通过`PipelineStartEPCallback`注册到优化流水线开始处
-
-### 克隆策略
-- 为每个有2+指针参数的kernel创建一个noalias克隆版本
-- 对所有指针参数添加noalias属性
-- 保持原始kernel函数不变
-
-### 命名规则
-- 原函数名 + `_noalias` 后缀
-- 例如：`vector_add` → `vector_add_noalias`
-
-## 构建要求
-
-需要重新构建LLVM/Clang以包含此功能：
+Activation:
 
 ```bash
-cd llvm-project/build
-ninja -j$(nproc)
+clang++ -mllvm -cuda-kernel-profile=/path/to/profile_test.json …
 ```
 
-## 文件修改列表
+Behaviour:
 
-### 新增文件
-- `llvm/include/llvm/Transforms/CudaKernelNoalias/CudaKernelNoalias.h`
-- `llvm/lib/Transforms/CudaKernelNoalias/CudaKernelNoalias.cpp`
-- `llvm/lib/Transforms/CudaKernelNoalias/CMakeLists.txt`
+1.  Scans every function with calling convention `ptx_kernel` (or with `nvvm.annotations` == "kernel").
+2.  Looks up the function name in the parsed profile map.
+3.  If at least one pointer index is listed:
+    *   Clones the function with name `<orig>_noalias`.
+    *   Adds attribute `noalias` to the specified parameters in the clone **only**.
+    *   Copies the original `nvvm.annotations` entry so that the clone is also visible to the GPU driver.
 
-### 修改文件
-- `clang/include/clang/Driver/Options.td`
-- `clang/include/clang/Basic/CodeGenOptions.def`
-- `clang/lib/CodeGen/BackendUtil.cpp`
-- `clang/lib/Driver/ToolChains/Clang.cpp`
-- `clang/lib/Driver/ToolChains/Cuda.cpp`
-- `llvm/lib/Transforms/CMakeLists.txt`
-- `llvm/lib/Passes/PassRegistry.def`
-- `llvm/lib/Passes/PassBuilder.cpp`
-- `llvm/lib/Passes/CMakeLists.txt`
-- `llvm/tools/opt/CMakeLists.txt`
 
-## 性能影响
+---
 
-- **编译时间**: 轻微增加，主要来自函数克隆
-- **二进制大小**: 每个符合条件的kernel增加一个克隆版本
-- **运行时性能**: 通过noalias属性可能获得更好的优化效果
+## 4. Clang Front-End Support (`CGCUDARuntime.cpp`)
 
-## 限制
+Compile-time switch:
 
-- 仅适用于有2个或更多指针参数的kernel函数
-- 需要CUDA编译环境
-- 克隆函数的实际使用需要运行时或链接时选择机制（未实现）
+```
+–fcuda-kernel-noalias   # sets CodeGenOpts.CudaKernelNoalias
+```
 
-## 未来改进
+(the flag name is indicative – use the one wired in your local driver).
 
-- 添加运行时自动选择机制
-- 根据指针别名分析结果智能决定是否克隆
-- 支持更细粒度的noalias控制
-- 添加性能分析和度量工具 
+### 4.1  Profile loading
+
+`loadCudaKernelProfile()` is executed on first use and re-uses **the same JSON file** as the LLVM pass.  The path is resolved in the following order:
+
+1.  Environment variable `CUDA_KERNEL_PROFILE`.
+2.  Last occurrence of the backend option `-cuda-kernel-profile=<file>`.
+
+### 4.2  Launch-site transformation
+
+At every host-side kernel call Clang now emits:
+
+```
+if (!TargetPtrs.empty() &&
+    !check_ptr_sets(TargetPtrs.size(), TargetPtrs, OtherPtrs.size(), OtherPtrs))
+  __device_stub__foo_noalias<<<…>>>();   // no alias – fast path
+else
+  __device_stub__foo<<<…>>>();           // aliasing possible – safe path
+```
+
+Where
+
+*   **TargetPtrs** – the pointer arguments whose indices were listed in the profile.
+*   **OtherPtrs**  – all other pointer arguments.
+*   The helper returns *true* when aliasing happen.
+
+The name lookup is tolerant: if the full mangled name is not present in the profile the front-end strips the `__device_stub__` prefix and performs a suffix match so that device-side and host-side names map correctly.
+
+### 4.3  External symbol
+
+`check_ptr_sets` is declared but **not** defined in Clang-generated IR.  It is defined at a lib based on nvbit.
+
+---
+
+## 5. Hook func – `check_ptr_sets`
+
+
+Signature:
+
+```c
+bool check_ptr_sets(int n_targets, void **targets,
+                    int n_others,  void **others);
+```
+
+It returns *true* if *any* pointer in *targets* may alias other ptr in the two sets.
+
+
+---
+
+## 6. Full build & run recipe
+
+```bash
+# 1. collect / generate JSON profile
+LD_PRELOAD=libkernel_profile.so ./gemm
+
+# 2. compile with pass + frontend support
+clang++ -fcuda-kernel-noalias \
+       -mllvm -cuda-kernel-profile=profile_test.json \
+       -L/path/to/libcheckkernel.so -lcheckkernel \
+       -c gemm.cu -o gemm_opt
+
+# 3. run
+export LD_PRELOAD=/path/to/libcheckkernel.so
+./gemm_opt
+```
+---
+
+## 7. Limitations & future work
+
+* Currently we only distinguish *alias* vs *no-alias* at the granularity of the whole kernel launch; finer grained specialisations (e.g. per-subset) are possible extensions.
+* Consider more host-device optimization chances, like Constant Propagation from host to device, as sometimes the kernel is launched with a fixed config(args, grid and block dimensions...)
+---
