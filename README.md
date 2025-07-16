@@ -1,338 +1,394 @@
-# The LLVM Compiler Infrastructure
+# CudaArgsProfile LLVM Pass
 
-[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/llvm/llvm-project/badge)](https://securityscorecards.dev/viewer/?uri=github.com/llvm/llvm-project)
-[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/8273/badge)](https://www.bestpractices.dev/projects/8273)
-[![libc++](https://github.com/llvm/llvm-project/actions/workflows/libcxx-build-and-test.yaml/badge.svg?branch=main&event=schedule)](https://github.com/llvm/llvm-project/actions/workflows/libcxx-build-and-test.yaml?query=event%3Aschedule)
+## 概述
 
-Welcome to the LLVM project!
+CudaArgsProfile是一个LLVM Pass，专门用于分析和记录CUDA kernel启动时的参数信息。它能够自动插入profiling代码，收集kernel参数的详细信息，并生成JSON格式的分析报告。
 
-This repository contains the source code for LLVM, a toolkit for the
-construction of highly optimized compilers, optimizers, and run-time
-environments.
+## 核心功能
 
-The LLVM project has multiple components. The core of the project is
-itself called "LLVM". This contains all of the tools, libraries, and header
-files needed to process intermediate representations and convert them into
-object files. Tools include an assembler, disassembler, bitcode analyzer, and
-bitcode optimizer.
+### 主要特性
 
-C-like languages use the [Clang](https://clang.llvm.org/) frontend. This
-component compiles C, C++, Objective-C, and Objective-C++ code into LLVM bitcode
--- and from there into object files, using LLVM.
+1. **自动参数分析**: 自动分析CUDA kernel函数的参数类型和结构
+2. **结构体参数重建**: 利用调试信息重建结构体成员的可读形式
+3. **结构体分割处理**: 智能处理被LLVM IR分割的结构体参数
+4. **详细的JSON报告**: 生成包含参数值、类型、大小等详细信息的JSON报告
+5. **支持多种数据类型**: 标量、指针、结构体等各种CUDA参数类型
 
-Other components include:
-the [libc++ C++ standard library](https://libcxx.llvm.org),
-the [LLD linker](https://lld.llvm.org), and more.
+### 支持的参数类型
 
-## Getting the Source Code and Building LLVM
+- **标量类型**: int8, int16, int32, int64, float, double
+- **指针类型**: 设备指针、主机指针
+- **结构体类型**: 普通结构体和被分割的结构体
+- **复合类型**: 嵌套结构体（通过调试信息解析）
 
-Consult the
-[Getting Started with LLVM](https://llvm.org/docs/GettingStarted.html#getting-the-source-code-and-building-llvm)
-page for information on building and running LLVM.
+## 技术背景
 
-For information on how to contribute to the LLVM project, please take a look at
-the [Contributing to LLVM](https://llvm.org/docs/Contributing.html) guide.
+### 结构体分割问题
 
-## Getting in touch
+在x86-64 ABI中，超过8字节的结构体参数会被编译器自动分割成多个8字节的部分传递。这导致了一个关键问题：
 
-Join the [LLVM Discourse forums](https://discourse.llvm.org/), [Discord
-chat](https://discord.gg/xS7Z362),
-[LLVM Office Hours](https://llvm.org/docs/GettingInvolved.html#office-hours) or
-[Regular sync-ups](https://llvm.org/docs/GettingInvolved.html#online-sync-ups).
+```c
+// 源代码
+struct Data16 {
+    int value;        // 4字节
+    float rate;       // 4字节
+    double precision; // 8字节
+};
 
-The LLVM project has adopted a [code of conduct](https://llvm.org/docs/CodeOfConduct.html) for
-participants to all modes of communication within the project.
-
-# CUDA Kernel Arguments Profiling Tool
-
-一个基于LLVM的CUDA内核参数自动分析工具，能够在编译时自动插入instrumentation代码，在运行时记录CUDA内核的启动参数、网格/块维度以及标量参数的名称和值。
-
-## 🎯 功能特性
-
-- **自动化instrumentation**：编译时自动插入profiling代码，无需修改源代码
-- **智能参数识别**：自动区分标量参数和指针参数，只记录标量值
-- **参数名称保留**：从LLVM IR中提取原始参数名称
-- **内核名称解析**：自动解析和简化CUDA内核函数名
-- **类型智能检测**：自动识别整数和浮点数类型
-- **零运行时开销**：只在启用profiling时产生开销
-
-## 📋 输出示例
-
-```
-CUDA Kernel Arguments Profile Log
-===================================
-
-Kernel Launch: vector_add
-  Grid Dimensions: (4, 1, 1)
-  Block Dimensions: (256, 1, 1)
-  Scalar Argument: n = 1000
-
-Kernel Launch: scalar_multiply
-  Grid Dimensions: (8, 1, 1)
-  Block Dimensions: (128, 1, 1)
-  Scalar Argument: scalar = 2.500000
-  Scalar Argument: size = 1000
+void kernel(struct Data16 data, int other);
 ```
 
-## 🏗️ 原理
+```llvm
+; LLVM IR层面
+define void @kernel(i64 %0, double %1, i32 %other)
+; 16字节结构体被分割为: i64(前8字节) + double(后8字节)
+```
 
-### 编译时组件
+**问题**: 传统的参数profiling方法假设`args[i]`直接对应第i个原始参数，但实际上：
+- `args[0]` = 结构体的前8字节 
+- `args[1]` = 结构体的后8字节
+- `args[2]` = other参数
 
-1. **LLVM Transform Pass** (`CudaArgsProfile`)
-   - 在LLVM IR层面分析CUDA程序
-   - 识别`cudaLaunchKernel()`调用
-   - 插入profiling函数调用
-   - 智能过滤标量vs指针参数
+### 解决方案
 
-2. **Clang Driver集成**
-   - 添加`-fcuda-args-profile`编译选项
-   - 自动启用profiling pass
-   - 无缝集成到CUDA编译流程
+本项目通过以下技术手段解决了结构体分割问题：
 
-### 运行时组件
+1. **调试信息分析**: 解析DWARF调试信息获取结构体成员详情
+2. **参数映射**: 建立原始参数到IR参数的映射关系
+3. **内存重建**: 从分割的parts重建完整的结构体数据
+4. **智能识别**: 自动识别哪些参数需要分割处理
 
-3. **Runtime Library** (`cuda_profile_runtime.c`)
-   - 提供profiling函数实现
-   - 智能参数值解析
-   - 日志文件管理
-   - 自动初始化/清理
+## 实现架构
+
+### 组件结构
+
+```
+CudaArgsProfile/
+├── CudaArgsProfile.cpp          # 主要的Pass实现
+├── CudaArgsProfileRuntime.c     # 运行时库
+└── README.md                    # 本文档
+```
+
+### 核心数据结构
+
+#### 1. ArgMappingInfo
+```cpp
+struct ArgMappingInfo {
+  std::string originalName;           // 原始参数名
+  ParamTypeInfo originalParam;        // 原始参数信息
+  std::vector<unsigned> argsIndices;  // 在args数组中的索引
+  std::vector<Type*> splitTypes;      // 分割后的IR类型
+  bool isSplit;                       // 是否被分割
+};
+```
+
+#### 2. ParamTypeInfo
+```cpp
+struct ParamTypeInfo {
+  enum Type { SCALAR_INT8, SCALAR_INT16, SCALAR_INT32, SCALAR_INT64,
+              SCALAR_FLOAT, SCALAR_DOUBLE, POINTER, STRUCT };
+  Type type;
+  size_t size;
+  size_t offset;
+  std::string name;
+  std::vector<ParamTypeInfo> members;  // 结构体成员
+};
+```
+
+#### 3. MemberInfo (Runtime)
+```c
+typedef struct {
+  char name[64];
+  int type;
+  int offset;
+  int size;
+} MemberInfo;
+```
 
 ### 工作流程
 
-```
-CUDA源码 → Clang前端 → LLVM IR → CudaArgsProfile Pass → 
-插入profiling调用 → 代码生成 → 链接运行时库 → 可执行文件
-```
+1. **Pass初始化**: 创建运行时函数声明和全局变量
+2. **CUDA调用识别**: 识别CUDA kernel启动调用
+3. **参数分析**: 分析kernel函数的参数类型和结构
+4. **结构体分割分析**: 通过调试信息判断参数是否被分割
+5. **代码插入**: 在kernel启动前后插入profiling代码
+6. **运行时收集**: 运行时库收集参数值并重建结构体
+7. **JSON输出**: 生成详细的分析报告
 
-运行时：
-```
-程序启动 → CUDA内核调用 → profiling函数执行 → 
-参数记录 → 日志输出 → 程序继续执行
-```
+## 技术细节
 
-## 🛠️ 实现步骤
-
-### 1. LLVM Pass实现
-
-**核心文件：**
-- `llvm/include/llvm/Transforms/CudaArgsProfile/CudaArgsProfile.h`
-- `llvm/lib/Transforms/CudaArgsProfile/CudaArgsProfile.cpp`
-- `llvm/lib/Transforms/CudaArgsProfile/CMakeLists.txt`
-
-**关键技术：**
-- 使用现代LLVM Pass Manager API
-- IR模式匹配识别CUDA API调用
-- 类型分析区分标量和指针
-- 函数名解析和demangling
-
-### 2. Clang集成
-
-**修改文件：**
-- `clang/include/clang/Driver/Options.td` - 添加命令行选项
-- `clang/include/clang/Basic/CodeGenOptions.def` - 添加CodeGen选项
-- `clang/lib/CodeGen/BackendUtil.cpp` - 集成到编译流程
-
-### 3. 运行时库
-
-**功能模块：**
-- 参数值智能解析
-- 类型检测（整数/浮点数）
-- 日志文件管理
-- 内存安全检查
-
-### 4. 构建系统集成
-
-**修改文件：**
-- `llvm/lib/Transforms/CMakeLists.txt`
-- `llvm/lib/Passes/CMakeLists.txt`
-- `llvm/lib/Passes/PassBuilder.cpp`
-- `llvm/lib/Passes/PassRegistry.def`
-
-## 🔧 编译安装
-
-### 前置要求
-
-- LLVM/Clang 源码
-- CMake 3.13+
-- Ninja 构建系统
-- CUDA Toolkit
-- C++17 编译器
-
-### 编译步骤
-
-1. **配置构建**
-```bash
-cd llvm-project
-mkdir build && cd build
-
-cmake -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_INSTALL_PREFIX=./opt \
-  -DLLVM_ENABLE_PROJECTS="clang" \
-  -DLLVM_TARGETS_TO_BUILD="X86;NVPTX" \
-  ../llvm
-```
-
-2. **构建和安装**
-```bash
-ninja
-ninja install
-```
-
-3. **编译运行时库**
-```bash
-cd ..
-gcc -shared -fPIC -o cuda_profile_runtime.so cuda_profile_runtime.c
-```
-
-## 📖 使用方法
-
-### 基本用法
-
-```bash
-# 编译CUDA程序并启用profiling
-./install/bin/clang++ -fcuda-args-profile \
-  --cuda-gpu-arch=sm_50 \
-  --no-cuda-version-check \
-  -L/usr/local/cuda/lib64 -lcudart \
-  ./cuda_profile_runtime.so \
-  your_cuda_program.cu -o your_program
-
-# 设置库路径并运行
-LD_LIBRARY_PATH=.:$LD_LIBRARY_PATH ./your_program
-```
-
-### 高级选项
-
-**环境变量：**
-- `CUDA_PROFILE_OUTPUT` - 指定输出文件路径（默认：`cuda_profile.log`）
-
-**编译选项：**
-- `-fcuda-args-profile` - 启用profiling
-- `-fno-cuda-args-profile` - 禁用profiling
-
-### 示例程序
+### 1. 调试信息解析
 
 ```cpp
-// test_cuda_profile.cu
-#include <cuda_runtime.h>
-#include <iostream>
-
-__global__ void vector_add(float* a, float* b, float* c, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) {
-        c[idx] = a[idx] + b[idx];
+ArgMappingInfo CudaArgsProfileImpl::analyzeParameterDebugInfo(
+    DIType *ParamType, const std::vector<Type*> &IRArgTypes, 
+    unsigned &currentIRArgIndex) {
+  
+  ArgMappingInfo mapping;
+  mapping.originalParam = analyzeDebugType(ParamType);
+  
+  // 判断是否需要分割
+  if (mapping.originalParam.size > 8) {
+    mapping.isSplit = true;
+    // 计算分割后的IR参数索引
+    size_t remainingSize = mapping.originalParam.size;
+    while (remainingSize > 0 && currentIRArgIndex < IRArgTypes.size()) {
+      mapping.argsIndices.push_back(currentIRArgIndex);
+      mapping.splitTypes.push_back(IRArgTypes[currentIRArgIndex]);
+      remainingSize -= 8;  // 每个分割部分8字节
+      currentIRArgIndex++;
     }
+  } else {
+    mapping.isSplit = false;
+    mapping.argsIndices.push_back(currentIRArgIndex);
+    mapping.splitTypes.push_back(IRArgTypes[currentIRArgIndex]);
+    currentIRArgIndex++;
+  }
+  
+  return mapping;
 }
+```
 
-__global__ void scalar_multiply(float* array, float scalar, int size) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < size) {
-        array[idx] *= scalar;
+### 2. 结构体重建
+
+```cpp
+void CudaArgsProfileImpl::handleSplitStructArgument(
+    IRBuilder<> &Builder, Value *Args, 
+    const ArgMappingInfo &mapping, unsigned paramIndex) {
+  
+  // 获取完整的结构体数据
+  Value *StructArgPtr = Builder.CreateGEP(VoidPtrTy, Args, 
+                                         Builder.getInt32(paramIndex));
+  Value *StructDataPtr = Builder.CreateLoad(VoidPtrTy, StructArgPtr);
+  
+  // 创建8字节对齐的分割部分
+  size_t numParts = (mapping.originalParam.size + 7) / 8;
+  ArrayType *PtrArrayType = ArrayType::get(VoidPtrTy, numParts);
+  Value *SplitParts = Builder.CreateAlloca(PtrArrayType);
+  
+  // 填充分割部分
+  for (size_t i = 0; i < numParts; ++i) {
+    Value *OffsetValue = Builder.getInt32(i * 8);
+    Value *PartPtr = Builder.CreateGEP(Type::getInt8Ty(*Context), 
+                                      StructDataPtr, OffsetValue);
+    // ... 存储到split_parts数组
+  }
+  
+  // 调用运行时函数
+  Builder.CreateCall(ProfileSplitStructFunc, {
+    Builder.getInt32(paramIndex), StructNamePtr, 
+    SplitPartsPtr, Builder.getInt32(numParts), MemberInfoPtr
+  });
+}
+```
+
+### 3. 运行时成员值提取
+
+```c
+void __cuda_profile_split_struct(int index, const char* struct_name, 
+                                void** split_parts, int num_parts, 
+                                const char* member_info) {
+  // 解析成员信息
+  // 格式: "member_count:name1:type1:offset1:size1:name2:type2:offset2:size2:..."
+  
+  char reconstructed[512] = "{";
+  
+  for (int i = 0; i < member_count; i++) {
+    MemberInfo* member = &members[i];
+    
+    // 根据偏移量找到对应的split part
+    int current_offset = 0;
+    for (int j = 0; j < num_parts; j++) {
+      if (member->offset >= current_offset && 
+          member->offset < current_offset + 8) {
+        
+        // 计算part内偏移
+        int part_offset = member->offset - current_offset;
+        uint8_t* part_data = (uint8_t*)split_parts[j];
+        
+        // 根据类型提取值
+        if (member->type == SCALAR_INT32) {
+          uint32_t val = *(uint32_t*)(part_data + part_offset);
+          sprintf(member_value, "%u", val);
+        } else if (member->type == SCALAR_FLOAT) {
+          float val = *(float*)(part_data + part_offset);
+          sprintf(member_value, "%f", val);
+        }
+        // ... 其他类型处理
+        break;
+      }
+      current_offset += 8;
     }
+    
+    sprintf(reconstructed + strlen(reconstructed), "%s: %s", 
+            member->name, member_value);
+  }
+  
+  strcat(reconstructed, "}");
+}
+```
+
+### 4. JSON输出格式
+
+```json
+{
+  "total_kernels": 3,
+  "kernels": [
+    {
+      "id": 0,
+      "name": "kernel_function_name",
+      "grid": [1,1,1],
+      "block": [1,1,1],
+      "params": [
+        {
+          "type": "split_struct",
+          "name": "Data16",
+          "size": 16,
+          "reconstructed_value": "{value: 123, rate: 2.718000, precision: 3.141590}",
+          "members": [
+            {"name": "value", "type": 2, "offset": 0, "size": 4},
+            {"name": "rate", "type": 4, "offset": 4, "size": 4},
+            {"name": "precision", "type": 5, "offset": 8, "size": 8}
+          ],
+          "split_parts": [
+            {"index": 0, "size": 8, "value": "..."},
+            {"index": 1, "size": 8, "value": "..."}
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+## 编译和使用
+
+### 1. 编译Pass
+
+```bash
+cd llvm-project
+mkdir build_profile
+cd build_profile
+cmake -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_PROJECTS="clang" ../llvm
+ninja
+```
+
+### 2. 编译运行时库
+
+```bash
+gcc -c CudaArgsProfileRuntime.c -o CudaArgsProfileRuntime.o
+```
+
+### 3. 使用Pass
+
+```bash
+build_profile/bin/clang++ -fcuda-args-profile -g -O0 \
+    your_cuda_program.cu CudaArgsProfileRuntime.o \
+    -o your_program \
+    --cuda-gpu-arch=sm_80 \
+    -I/usr/local/cuda/include \
+    -L/usr/local/cuda/lib64 -lcudart
+```
+
+### 4. 运行和分析
+
+```bash
+./your_program
+# 生成 cuda_profile.json
+```
+
+## 测试示例
+
+### 测试代码
+
+```c
+struct Data16 {
+    int value;
+    float rate;
+    double precision;
+};
+
+__global__ void test_kernel(struct Data16 data, int other) {
+    printf("value=%d, rate=%f, precision=%f, other=%d\n", 
+           data.value, data.rate, data.precision, other);
 }
 
 int main() {
-    const int N = 1000;
-    float *d_a, *d_b, *d_c;
-    
-    // 分配GPU内存
-    cudaMalloc(&d_a, N * sizeof(float));
-    cudaMalloc(&d_b, N * sizeof(float));
-    cudaMalloc(&d_c, N * sizeof(float));
-    
-    // 启动内核
-    vector_add<<<4, 256>>>(d_a, d_b, d_c, N);
+    struct Data16 data = {123, 2.718f, 3.14159};
+    test_kernel<<<1, 1>>>(data, 456);
     cudaDeviceSynchronize();
-    
-    scalar_multiply<<<8, 128>>>(d_c, 2.5f, N);
-    cudaDeviceSynchronize();
-    
-    // 清理
-    cudaFree(d_a);
-    cudaFree(d_b);
-    cudaFree(d_c);
-    
     return 0;
 }
 ```
 
-## 🔍 技术细节
+### 输出结果
 
-### Pass实现原理
-
-1. **函数识别**：在LLVM IR中识别`cudaLaunchKernel()`调用
-2. **参数提取**：从调用指令中提取内核函数指针和参数数组
-3. **类型分析**：分析内核函数签名，区分标量和指针类型
-4. **代码插入**：在调用前插入profiling函数调用
-5. **名称解析**：提取并简化内核函数名称
-
-### 运行时库设计
-
-1. **智能类型检测**：
-   - 整数范围检测（-1,000,000 到 1,000,000）
-   - 浮点数有效性检查
-   - 指针地址识别和过滤
-
-2. **内存安全**：
-   - 空指针检查
-   - 访问边界验证
-   - 异常处理
-
-3. **性能优化**：
-   - 最小化运行时开销
-   - 延迟初始化
-   - 缓冲输出
-
-### 局限性
-
-- 只支持标量参数profiling（整数、浮点数）
-- 不支持结构体或数组参数
-- 需要重新编译LLVM/Clang
-- 仅在Linux系统测试
-
-## 🐛 故障排除
-
-### 常见问题
-
-1. **编译错误：`undefined reference to profile_*`**
-   - 确保链接了运行时库：`./cuda_profile_runtime.so`
-   - 检查`LD_LIBRARY_PATH`设置
-
-2. **Pass未生效**
-   - 检查`-fcuda-args-profile`选项是否正确
-   - 确认LLVM/Clang正确安装了修改版本
-
-3. **运行时崩溃**
-   - 检查CUDA版本兼容性
-   - 尝试不同的GPU架构：`--cuda-gpu-arch=sm_60`
-
-4. **空日志文件**
-   - 确认程序中有CUDA内核调用
-   - 检查文件权限和路径
-
-### 调试技巧
-
-```bash
-# 查看编译详细信息
-./install/bin/clang++ -v -fcuda-args-profile ...
-
-# 检查Pass是否加载
-export LLVM_DEBUG=1
-./install/bin/clang++ -fcuda-args-profile ...
-
-# 查看LLVM IR
-./install/bin/clang++ -S -emit-llvm -fcuda-args-profile ...
+```json
+{
+  "kernels": [
+    {
+      "params": [
+        {
+          "type": "split_struct",
+          "name": "Data16", 
+          "reconstructed_value": "{value: 123, rate: 2.718000, precision: 3.141590}",
+          "members": [
+            {"name": "value", "type": 2, "offset": 0, "size": 4},
+            {"name": "rate", "type": 4, "offset": 4, "size": 4},
+            {"name": "precision", "type": 5, "offset": 8, "size": 8}
+          ]
+        }
+      ]
+    }
+  ]
+}
 ```
 
-## 📄 许可证
+## 优势和应用
 
-本项目基于Apache License 2.0许可证，与LLVM项目保持一致。
+### 技术优势
 
-## 🤝 贡献
+1. **准确性**: 正确处理结构体参数分割问题
+2. **完整性**: 支持所有常见的CUDA参数类型
+3. **可读性**: 生成人类可读的结构体成员信息
+4. **自动化**: 无需手动标注，自动分析参数结构
+5. **性能**: 最小化运行时开销
 
-欢迎提交Issue和Pull Request来改进这个工具！
+### 应用场景
 
-## 📞 联系
+1. **性能分析**: 分析kernel参数传递的性能影响
+2. **调试辅助**: 帮助理解kernel接收的实际参数值
+3. **优化指导**: 识别参数传递的瓶颈
+4. **代码审查**: 验证参数传递的正确性
+
+## 技术限制
+
+1. **调试信息依赖**: 需要编译时包含调试信息(-g)
+2. **DWARF格式**: 依赖标准的DWARF调试信息格式
+3. **平台支持**: 主要针对x86-64和CUDA平台
+4. **复杂类型**: 对于非常复杂的嵌套结构体可能需要改进
+
+## 未来改进方向
+
+1. **更多数据类型**: 支持数组、联合体等复杂类型
+2. **性能优化**: 进一步减少运行时开销
+3. **可视化**: 提供图形化的分析界面
+4. **扩展平台**: 支持更多GPU架构和平台
+5. **深度分析**: 提供更深入的性能分析功能
+
+## 贡献指南
+
+欢迎提交issue和pull request。在提交代码前，请确保：
+
+1. 代码符合LLVM编码规范
+2. 添加适当的测试用例
+3. 更新相关文档
+4. 通过所有现有测试
+
+## 许可证
+
+本项目遵循Apache License 2.0，与LLVM项目保持一致。
+
+## 联系方式
 
 如有问题或建议，请通过GitHub Issues联系。

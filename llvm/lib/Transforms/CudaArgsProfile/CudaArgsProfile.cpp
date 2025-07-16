@@ -24,6 +24,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
+#include "llvm/BinaryFormat/Dwarf.h"
 #include <sstream>
 #include <vector>
 #include <string>
@@ -47,9 +48,21 @@ struct ParamTypeInfo {
   std::vector<ParamTypeInfo> members; // For struct types
 };
 
+// 新增：参数映射信息结构
+struct ArgMappingInfo {
+  std::string originalName;           // 原始参数名
+  ParamTypeInfo originalParam;        // 原始参数信息
+  std::vector<unsigned> argsIndices;  // 在args数组中的索引
+  std::vector<Type*> splitTypes;      // 拆分后的IR类型
+  bool isSplit;                       // 是否被拆分
+  
+  ArgMappingInfo() : isSplit(false) {}
+};
+
 struct KernelInfo {
   std::string name;
   std::vector<ParamTypeInfo> params;
+  std::vector<ArgMappingInfo> argMappings;  // 新增：参数映射信息
   size_t totalParamSize;
 };
 
@@ -66,6 +79,7 @@ private:
   Function *ProfileStructFunc;
   Function *ProfileStructValueFunc;
   Function *ProfilePointerFunc;
+  Function *ProfileSplitStructFunc;  // 新增：处理拆分结构体的函数
   
   // Global variables
   GlobalVariable *KernelCounterGV;
@@ -88,8 +102,12 @@ private:
   bool isCudaLaunchCall(CallInst *CI);
   Function *getKernelFunction(Value *KernelArg);
   KernelInfo analyzeKernelFunction(Function *KernelFunc);
+  std::vector<ArgMappingInfo> analyzeStructSplitting(Function *KernelFunc);  // 新增
+  ArgMappingInfo analyzeParameterDebugInfo(DIType *ParamType, const std::vector<Type*> &IRArgTypes, unsigned &currentIRArgIndex);  // 新增
   ParamTypeInfo analyzeType(Type *Ty, const std::string &Name = "");
+  ParamTypeInfo analyzeDebugType(DIType *DebugType);  // 新增
   void insertProfilingCalls(CallInst *LaunchCall, const KernelInfo &KInfo);
+  void handleSplitStructArgument(IRBuilder<> &Builder, Value *Args, const ArgMappingInfo &mapping, unsigned paramIndex);  // 新增
   std::string generateKernelInfoString(const KernelInfo &KInfo);
   std::string generateStructMemberInfo(const ParamTypeInfo &StructInfo);
   void createModuleInitializer();
@@ -135,6 +153,14 @@ void CudaArgsProfileImpl::createRuntimeFunctions() {
   ProfilePointerFunc = Function::Create(
     FunctionType::get(VoidTy, {Int32Ty, VoidPtrTy}, false),
     Function::ExternalLinkage, "__cuda_profile_pointer", M);
+  
+  // 新增：void __cuda_profile_split_struct(int index, const char* struct_name, 
+  //                                        void** split_parts, int num_parts, 
+  //                                        const char* member_info)
+  Type *VoidPtrPtrTy = PointerType::getUnqual(VoidPtrTy);
+  ProfileSplitStructFunc = Function::Create(
+    FunctionType::get(VoidTy, {Int32Ty, CharPtrTy, VoidPtrPtrTy, Int32Ty, CharPtrTy}, false),
+    Function::ExternalLinkage, "__cuda_profile_split_struct", M);
 }
 
 void CudaArgsProfileImpl::createGlobalVariables() {
@@ -225,42 +251,17 @@ KernelInfo CudaArgsProfileImpl::analyzeKernelFunction(Function *KernelFunc) {
   KInfo.name = KernelFunc->getName().str();
   KInfo.totalParamSize = 0;
   
-  // Check if this is a struct-based kernel by examining the function name
-  bool isStructKernel = KInfo.name.find("Struct") != std::string::npos;
+  // 首先尝试使用调试信息分析结构体拆分
+  KInfo.argMappings = analyzeStructSplitting(KernelFunc);
   
-  // Simple struct detection: for now, only handle simple cases
-  // More complex struct handling would require more sophisticated analysis
-  if (isStructKernel && KInfo.name.find("testSimpleStruct") != std::string::npos) {
-    // Handle the simple struct case
-    for (auto &Arg : KernelFunc->args()) {
-      ParamTypeInfo ParamInfo = analyzeType(Arg.getType(), Arg.getName().str());
-      
-      // If this is an 8-byte integer, treat it as SimpleStruct
-      if (ParamInfo.type == ParamTypeInfo::SCALAR_INT64 && ParamInfo.size == 8) {
-        ParamInfo.type = ParamTypeInfo::STRUCT;
-        ParamInfo.name = "SimpleStruct";
-        
-        // Two int32 members
-        ParamTypeInfo member1, member2;
-        member1.type = ParamTypeInfo::SCALAR_INT32;
-        member1.size = 4;
-        member1.offset = 0;
-        member1.name = "member_0";
-        
-        member2.type = ParamTypeInfo::SCALAR_INT32;
-        member2.size = 4;
-        member2.offset = 4;
-        member2.name = "member_1";
-        
-        ParamInfo.members.push_back(member1);
-        ParamInfo.members.push_back(member2);
-      }
-      
-      KInfo.params.push_back(ParamInfo);
-      KInfo.totalParamSize += ParamInfo.size;
+  if (!KInfo.argMappings.empty()) {
+    // 使用调试信息分析的结果
+    for (const auto &mapping : KInfo.argMappings) {
+      KInfo.params.push_back(mapping.originalParam);
+      KInfo.totalParamSize += mapping.originalParam.size;
     }
   } else {
-    // Handle regular cases or skip complex struct cases for now
+    // 降级到原始的类型分析
     for (auto &Arg : KernelFunc->args()) {
       ParamTypeInfo ParamInfo = analyzeType(Arg.getType(), Arg.getName().str());
       KInfo.params.push_back(ParamInfo);
@@ -269,6 +270,152 @@ KernelInfo CudaArgsProfileImpl::analyzeKernelFunction(Function *KernelFunc) {
   }
   
   return KInfo;
+}
+
+// 新增：分析结构体拆分的核心函数
+std::vector<ArgMappingInfo> CudaArgsProfileImpl::analyzeStructSplitting(Function *KernelFunc) {
+  std::vector<ArgMappingInfo> mappings;
+  
+  // 获取函数的调试信息
+  DISubprogram *SP = KernelFunc->getSubprogram();
+  if (!SP) {
+    return mappings;  // 没有调试信息，返回空
+  }
+  
+  // 获取函数类型的调试信息
+  DISubroutineType *FuncType = SP->getType();
+  if (!FuncType) return mappings;
+  
+  DITypeRefArray TypeArray = FuncType->getTypeArray();
+  if (!TypeArray) return mappings;
+  
+  // 获取IR参数类型列表
+  std::vector<Type*> IRArgTypes;
+  for (auto &Arg : KernelFunc->args()) {
+    IRArgTypes.push_back(Arg.getType());
+  }
+  
+  // 分析每个原始参数（跳过返回类型）
+  unsigned currentIRArgIndex = 0;
+  for (unsigned i = 1; i < TypeArray.size() && currentIRArgIndex < IRArgTypes.size(); ++i) {
+    if (DIType *ParamType = TypeArray[i]) {
+      ArgMappingInfo mapping = analyzeParameterDebugInfo(ParamType, IRArgTypes, currentIRArgIndex);
+      if (!mapping.originalName.empty()) {
+        mappings.push_back(mapping);
+      }
+    }
+  }
+  
+  return mappings;
+}
+
+// 新增：分析单个参数的调试信息
+ArgMappingInfo CudaArgsProfileImpl::analyzeParameterDebugInfo(DIType *ParamType, 
+                                                             const std::vector<Type*> &IRArgTypes, 
+                                                             unsigned &currentIRArgIndex) {
+  ArgMappingInfo mapping;
+  
+  if (currentIRArgIndex >= IRArgTypes.size()) {
+    return mapping;  // 防止越界
+  }
+  
+  // 如果是结构体类型
+  if (DICompositeType *CompositeType = dyn_cast<DICompositeType>(ParamType)) {
+    if (CompositeType->getTag() == dwarf::DW_TAG_structure_type) {
+      mapping.originalName = CompositeType->getName().str();
+      mapping.originalParam = analyzeDebugType(CompositeType);
+      
+      uint64_t structSizeBits = CompositeType->getSizeInBits();
+      
+      // 根据结构体大小判断拆分模式
+      if (structSizeBits <= 64) {
+        // 8字节或更小 -> 单个参数
+        mapping.isSplit = false;
+        mapping.argsIndices.push_back(currentIRArgIndex);
+        mapping.splitTypes.push_back(IRArgTypes[currentIRArgIndex]);
+        currentIRArgIndex++;
+      } else if (structSizeBits <= 128) {
+        // 16字节 -> 通常拆分为两个8字节参数
+        mapping.isSplit = true;
+        mapping.argsIndices.push_back(currentIRArgIndex);
+        mapping.argsIndices.push_back(currentIRArgIndex + 1);
+        mapping.splitTypes.push_back(IRArgTypes[currentIRArgIndex]);
+        mapping.splitTypes.push_back(IRArgTypes[currentIRArgIndex + 1]);
+        currentIRArgIndex += 2;
+      } else {
+        // 更大的结构体 -> byval传递
+        mapping.isSplit = false;
+        mapping.argsIndices.push_back(currentIRArgIndex);
+        mapping.splitTypes.push_back(IRArgTypes[currentIRArgIndex]);
+        currentIRArgIndex++;
+      }
+      
+      return mapping;
+    }
+  }
+  
+  // 非结构体类型
+  mapping.originalParam = analyzeType(IRArgTypes[currentIRArgIndex]);
+  mapping.isSplit = false;
+  mapping.argsIndices.push_back(currentIRArgIndex);
+  mapping.splitTypes.push_back(IRArgTypes[currentIRArgIndex]);
+  currentIRArgIndex++;
+  
+  return mapping;
+}
+
+// 新增：从调试信息分析类型
+ParamTypeInfo CudaArgsProfileImpl::analyzeDebugType(DIType *DebugType) {
+  ParamTypeInfo info;
+  
+  if (DICompositeType *CompositeType = dyn_cast<DICompositeType>(DebugType)) {
+    if (CompositeType->getTag() == dwarf::DW_TAG_structure_type) {
+      info.type = ParamTypeInfo::STRUCT;
+      info.name = CompositeType->getName().str();
+      info.size = CompositeType->getSizeInBits() / 8;  // 转换为字节
+      
+      // 分析结构体成员
+      DINodeArray Elements = CompositeType->getElements();
+      for (DINode *Element : Elements) {
+        if (DIDerivedType *Member = dyn_cast<DIDerivedType>(Element)) {
+          if (Member->getTag() == dwarf::DW_TAG_member) {
+            ParamTypeInfo memberInfo;
+            memberInfo.name = Member->getName().str();
+            memberInfo.offset = Member->getOffsetInBits() / 8;  // 转换为字节
+            memberInfo.size = Member->getSizeInBits() / 8;
+            
+            // 根据基础类型设置成员类型
+            if (DIType *BaseType = Member->getBaseType()) {
+              if (DIBasicType *BasicType = dyn_cast<DIBasicType>(BaseType)) {
+                unsigned encoding = BasicType->getEncoding();
+                unsigned sizeBits = BasicType->getSizeInBits();
+                
+                if (encoding == dwarf::DW_ATE_signed || encoding == dwarf::DW_ATE_unsigned) {
+                  switch (sizeBits) {
+                    case 8:  memberInfo.type = ParamTypeInfo::SCALAR_INT8; break;
+                    case 16: memberInfo.type = ParamTypeInfo::SCALAR_INT16; break;
+                    case 32: memberInfo.type = ParamTypeInfo::SCALAR_INT32; break;
+                    case 64: memberInfo.type = ParamTypeInfo::SCALAR_INT64; break;
+                    default: memberInfo.type = ParamTypeInfo::SCALAR_INT32; break;
+                  }
+                } else if (encoding == dwarf::DW_ATE_float) {
+                  if (sizeBits == 32) {
+                    memberInfo.type = ParamTypeInfo::SCALAR_FLOAT;
+                  } else if (sizeBits == 64) {
+                    memberInfo.type = ParamTypeInfo::SCALAR_DOUBLE;
+                  }
+                }
+              }
+            }
+            
+            info.members.push_back(memberInfo);
+          }
+        }
+      }
+    }
+  }
+  
+  return info;
 }
 
 ParamTypeInfo CudaArgsProfileImpl::analyzeType(Type *Ty, const std::string &Name) {
@@ -321,8 +468,6 @@ void CudaArgsProfileImpl::insertProfilingCalls(CallInst *LaunchCall,
   IRBuilder<> Builder(LaunchCall);
   
   // Get launch parameters
-  // Note: cudaLaunchKernel has expanded arguments due to struct splitting
-  // The args array is at index 5, not 3
   Value *Args = LaunchCall->getArgOperand(5);
   
   // Load and increment kernel counter
@@ -330,8 +475,7 @@ void CudaArgsProfileImpl::insertProfilingCalls(CallInst *LaunchCall,
   Value *NewId = Builder.CreateAdd(KernelId, Builder.getInt32(1));
   Builder.CreateStore(NewId, KernelCounterGV);
   
-  // For now, use default grid and block dimensions since the struct is expanded
-  // TODO: Properly extract dimensions from the expanded arguments
+  // For now, use default grid and block dimensions
   Value *GridX = Builder.getInt32(1);
   Value *GridY = Builder.getInt32(1);
   Value *GridZ = Builder.getInt32(1);
@@ -349,47 +493,135 @@ void CudaArgsProfileImpl::insertProfilingCalls(CallInst *LaunchCall,
   Builder.CreateCall(ProfileStartFunc, {KernelNamePtr, KernelId, GridX, GridY, GridZ, 
                                         BlockX, BlockY, BlockZ});
   
-  // Profile each argument
+  // Profile each argument using mapping information
   Type *VoidPtrTy = PointerType::getUnqual(Type::getInt8Ty(*Context));
   
-  for (size_t i = 0; i < KInfo.params.size(); ++i) {
-    const ParamTypeInfo &ParamInfo = KInfo.params[i];
-    
-    // Get pointer to argument: args[i]
-    // args is void**, so each args[i] is a void* pointing to the actual value
-    Value *ArgPtr = Builder.CreateGEP(VoidPtrTy, Args, 
-                                      Builder.getInt32(i));
-    Value *ArgValuePtr = Builder.CreateLoad(VoidPtrTy, ArgPtr);
-    
-    if (ParamInfo.type == ParamTypeInfo::POINTER) {
-      // For pointers, ArgValuePtr points to the pointer value, need to load it
-      Value *PointerValue = Builder.CreateLoad(VoidPtrTy, ArgValuePtr);
-      Builder.CreateCall(ProfilePointerFunc, {Builder.getInt32(i), PointerValue});
-    } else if (ParamInfo.type == ParamTypeInfo::STRUCT) {
-      // For struct values, use the new struct value profiling function
-      std::string StructName = ParamInfo.name.empty() ? "struct_" + std::to_string(i) : ParamInfo.name;
-      Value *StructNameStr = Builder.CreateGlobalString(StructName);
-      Value *StructNamePtr = Builder.CreatePointerCast(StructNameStr, CharPtrTy);
+  if (!KInfo.argMappings.empty()) {
+    // 使用调试信息的映射
+    for (size_t i = 0; i < KInfo.argMappings.size(); ++i) {
+      const ArgMappingInfo &mapping = KInfo.argMappings[i];
       
-      // Create member info string with detailed type information
-      std::string MemberInfoStr = generateStructMemberInfo(ParamInfo);
-      Value *MemberInfoStrVal = Builder.CreateGlobalString(MemberInfoStr);
-      Value *MemberInfoPtr = Builder.CreatePointerCast(MemberInfoStrVal, CharPtrTy);
+      if (mapping.isSplit) {
+        // 处理拆分的结构体参数
+        handleSplitStructArgument(Builder, Args, mapping, i);
+      } else {
+        // 处理普通参数
+        unsigned argIndex = mapping.argsIndices[0];
+        Value *ArgPtr = Builder.CreateGEP(VoidPtrTy, Args, Builder.getInt32(argIndex));
+        Value *ArgValuePtr = Builder.CreateLoad(VoidPtrTy, ArgPtr);
+        
+        const ParamTypeInfo &ParamInfo = mapping.originalParam;
+        
+        if (ParamInfo.type == ParamTypeInfo::POINTER) {
+          Value *PointerValue = Builder.CreateLoad(VoidPtrTy, ArgValuePtr);
+          Builder.CreateCall(ProfilePointerFunc, {Builder.getInt32(i), PointerValue});
+        } else if (ParamInfo.type == ParamTypeInfo::STRUCT) {
+          std::string StructName = ParamInfo.name.empty() ? "struct_" + std::to_string(i) : ParamInfo.name;
+          Value *StructNameStr = Builder.CreateGlobalString(StructName);
+          Value *StructNamePtr = Builder.CreatePointerCast(StructNameStr, CharPtrTy);
+          
+          std::string MemberInfoStr = generateStructMemberInfo(ParamInfo);
+          Value *MemberInfoStrVal = Builder.CreateGlobalString(MemberInfoStr);
+          Value *MemberInfoPtr = Builder.CreatePointerCast(MemberInfoStrVal, CharPtrTy);
+          
+          Builder.CreateCall(ProfileStructValueFunc, {Builder.getInt32(i), StructNamePtr, 
+                                                      ArgValuePtr, Builder.getInt64(ParamInfo.size), 
+                                                      MemberInfoPtr});
+        } else {
+          Builder.CreateCall(ProfileScalarFunc, {Builder.getInt32(i), 
+                                                 Builder.getInt32(ParamInfo.type),
+                                                 ArgValuePtr, Builder.getInt64(ParamInfo.size)});
+        }
+      }
+    }
+  } else {
+    // 降级到原始处理方式
+    for (size_t i = 0; i < KInfo.params.size(); ++i) {
+      const ParamTypeInfo &ParamInfo = KInfo.params[i];
       
-      // Call the struct value profiling function
-      Builder.CreateCall(ProfileStructValueFunc, {Builder.getInt32(i), StructNamePtr, 
-                                                  ArgValuePtr, Builder.getInt64(ParamInfo.size), 
-                                                  MemberInfoPtr});
-    } else {
-      // For scalars, ArgValuePtr points to the scalar value, pass it directly
-      Builder.CreateCall(ProfileScalarFunc, {Builder.getInt32(i), 
-                                             Builder.getInt32(ParamInfo.type),
-                                             ArgValuePtr, Builder.getInt64(ParamInfo.size)});
+      Value *ArgPtr = Builder.CreateGEP(VoidPtrTy, Args, Builder.getInt32(i));
+      Value *ArgValuePtr = Builder.CreateLoad(VoidPtrTy, ArgPtr);
+      
+      if (ParamInfo.type == ParamTypeInfo::POINTER) {
+        Value *PointerValue = Builder.CreateLoad(VoidPtrTy, ArgValuePtr);
+        Builder.CreateCall(ProfilePointerFunc, {Builder.getInt32(i), PointerValue});
+      } else if (ParamInfo.type == ParamTypeInfo::STRUCT) {
+        std::string StructName = ParamInfo.name.empty() ? "struct_" + std::to_string(i) : ParamInfo.name;
+        Value *StructNameStr = Builder.CreateGlobalString(StructName);
+        Value *StructNamePtr = Builder.CreatePointerCast(StructNameStr, CharPtrTy);
+        
+        std::string MemberInfoStr = generateStructMemberInfo(ParamInfo);
+        Value *MemberInfoStrVal = Builder.CreateGlobalString(MemberInfoStr);
+        Value *MemberInfoPtr = Builder.CreatePointerCast(MemberInfoStrVal, CharPtrTy);
+        
+        Builder.CreateCall(ProfileStructValueFunc, {Builder.getInt32(i), StructNamePtr, 
+                                                    ArgValuePtr, Builder.getInt64(ParamInfo.size), 
+                                                    MemberInfoPtr});
+      } else {
+        Builder.CreateCall(ProfileScalarFunc, {Builder.getInt32(i), 
+                                               Builder.getInt32(ParamInfo.type),
+                                               ArgValuePtr, Builder.getInt64(ParamInfo.size)});
+      }
     }
   }
   
   // Call profile end
   Builder.CreateCall(ProfileEndFunc);
+}
+
+// 新增：处理拆分的结构体参数
+void CudaArgsProfileImpl::handleSplitStructArgument(IRBuilder<> &Builder, Value *Args, 
+                                                   const ArgMappingInfo &mapping, 
+                                                   unsigned paramIndex) {
+  Type *VoidPtrTy = PointerType::getUnqual(Type::getInt8Ty(*Context));
+  Type *CharPtrTy = PointerType::getUnqual(Type::getInt8Ty(*Context));
+  
+  // 创建结构体名称字符串
+  std::string StructName = mapping.originalName.empty() ? 
+                          "struct_" + std::to_string(paramIndex) : mapping.originalName;
+  Value *StructNameStr = Builder.CreateGlobalString(StructName);
+  Value *StructNamePtr = Builder.CreatePointerCast(StructNameStr, CharPtrTy);
+  
+  // 创建成员信息字符串
+  std::string MemberInfoStr = generateStructMemberInfo(mapping.originalParam);
+  Value *MemberInfoStrVal = Builder.CreateGlobalString(MemberInfoStr);
+  Value *MemberInfoPtr = Builder.CreatePointerCast(MemberInfoStrVal, CharPtrTy);
+  
+  // 获取完整的结构体数据 - Args[paramIndex]包含完整的结构体
+  Value *StructArgPtr = Builder.CreateGEP(VoidPtrTy, Args, Builder.getInt32(paramIndex));
+  Value *StructDataPtr = Builder.CreateLoad(VoidPtrTy, StructArgPtr);
+  
+  // 创建拆分部分的指针数组
+  // 我们需要根据结构体的内存布局来创建split parts
+  size_t structSize = mapping.originalParam.size;
+  size_t numParts = (structSize + 7) / 8;  // 8字节对齐的部分数量
+  
+  ArrayType *PtrArrayType = ArrayType::get(VoidPtrTy, numParts);
+  Value *SplitParts = Builder.CreateAlloca(PtrArrayType);
+  
+  // 填充拆分部分的指针 - 每个part是8字节对齐的
+  for (size_t i = 0; i < numParts; ++i) {
+    // 计算偏移量
+    Value *OffsetValue = Builder.getInt32(i * 8);
+    Value *PartPtr = Builder.CreateGEP(Type::getInt8Ty(*Context), StructDataPtr, OffsetValue);
+    
+    Value *ArrayElementPtr = Builder.CreateGEP(PtrArrayType, SplitParts, 
+                                               {Builder.getInt32(0), Builder.getInt32(i)});
+    Builder.CreateStore(PartPtr, ArrayElementPtr);
+  }
+  
+  // 转换为void**
+  Value *SplitPartsPtr = Builder.CreatePointerCast(SplitParts, 
+                                                    PointerType::getUnqual(VoidPtrTy));
+  
+  // 调用拆分结构体的profiling函数
+  Builder.CreateCall(ProfileSplitStructFunc, {
+    Builder.getInt32(paramIndex), 
+    StructNamePtr, 
+    SplitPartsPtr, 
+    Builder.getInt32(numParts),
+    MemberInfoPtr
+  });
 }
 
 std::string CudaArgsProfileImpl::generateKernelInfoString(const KernelInfo &KInfo) {
@@ -414,7 +646,7 @@ std::string CudaArgsProfileImpl::generateStructMemberInfo(const ParamTypeInfo &S
   oss << StructInfo.members.size();
   
   for (const ParamTypeInfo &Member : StructInfo.members) {
-    oss << ":" << Member.type << ":" << Member.offset << ":" << Member.size;
+    oss << ":" << Member.name << ":" << Member.type << ":" << Member.offset << ":" << Member.size;
   }
   
   return oss.str();
