@@ -1299,6 +1299,13 @@ def fcuda_kernel_noalias : Flag<["-"], "fcuda-kernel-noalias">, Group<cuda_Group
 def fno_cuda_kernel_noalias : Flag<["-"], "fno-cuda-kernel-noalias">, Group<cuda_Group>,
   Visibility<[ClangOption, CC1Option]>,
   HelpText<"Disable CUDA kernel noalias optimization">;
+def fcuda_kernel_const : Flag<["-"], "fcuda-kernel-const">, Group<cuda_Group>,
+  Visibility<[ClangOption, CC1Option]>,
+  HelpText<"Enable CUDA kernel constant propagation optimization">,
+  MarshallingInfoFlag<CodeGenOpts<"CudaKernelConst">>;
+def fno_cuda_kernel_const : Flag<["-"], "fno-cuda-kernel-const">, Group<cuda_Group>,
+  Visibility<[ClangOption, CC1Option]>,
+  HelpText<"Disable CUDA kernel constant propagation optimization">;
 def : Flag<["-"], "fcuda-rdc">, Alias<fgpu_rdc>;
 def : Flag<["-"], "fno-cuda-rdc">, Alias<fno_gpu_rdc>;
 defm cuda_short_ptr : BoolFOption<"cuda-short-ptr",

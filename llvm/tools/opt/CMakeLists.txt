@@ -12,6 +12,7 @@ set(LLVM_LINK_COMPONENTS
   Core
   Coroutines
   CudaKernelNoalias
+  CudaKernelConst
   Extensions
   IPO
   IRReader

@@ -57,6 +57,7 @@
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/HipStdPar/HipStdPar.h"
 #include "llvm/Transforms/CudaKernelNoalias/CudaKernelNoalias.h"
+#include "llvm/Transforms/CudaKernelConst/CudaKernelConst.h"
 #include "llvm/Transforms/IPO/EmbedBitcodePass.h"
 #include "llvm/Transforms/IPO/LowerTypeTests.h"
 #include "llvm/Transforms/IPO/ThinLTOBitcodeWriter.h"
@@ -1115,6 +1116,14 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
       PB.registerPipelineEarlySimplificationEPCallback(
           [&](ModulePassManager &MPM, OptimizationLevel Level, ThinOrFullLTOPhase Phase) {
             MPM.addPass(CudaKernelNoaliasPass());
+          });
+    }
+
+    // Handle CUDA kernel constant propagation optimization.
+    if (CodeGenOpts.CudaKernelConst) {
+      PB.registerPipelineEarlySimplificationEPCallback(
+          [&](ModulePassManager &MPM, OptimizationLevel Level, ThinOrFullLTOPhase Phase) {
+            MPM.addPass(CudaKernelConstPass());
           });
     }
 

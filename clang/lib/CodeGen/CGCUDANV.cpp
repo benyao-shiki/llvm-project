@@ -143,6 +143,7 @@ private:
   void emitDeviceStubBodyLegacy(CodeGenFunction &CGF, FunctionArgList &Args);
   void emitDeviceStubBodyNew(CodeGenFunction &CGF, FunctionArgList &Args);
   void emitNoaliasDeviceStub(CodeGenFunction &CGF, FunctionArgList &Args);
+  void emitConstDeviceStub(CodeGenFunction &CGF, FunctionArgList &Args);
   std::string getDeviceSideName(const NamedDecl *ND) override;
 
   void registerDeviceVar(const VarDecl *VD, llvm::GlobalVariable &Var,
@@ -338,6 +339,11 @@ void CGNVCUDARuntime::emitDeviceStub(CodeGenFunction &CGF,
   // generate additional noalias stub
   if (CGM.getCodeGenOpts().CudaKernelNoalias && pointerParamCount >= 2) {
     emitNoaliasDeviceStub(CGF, Args);
+  }
+  
+  // Check if we need to generate const propagation version as well
+  if (CGM.getCodeGenOpts().CudaKernelConst) {
+    emitConstDeviceStub(CGF, Args);
   }
 }
 
@@ -575,8 +581,27 @@ void CGNVCUDARuntime::emitNoaliasDeviceStub(CodeGenFunction &CGF,
   // Copy attributes from original function
   NoaliasStub->copyAttributesFrom(CGF.CurFn);
   
-  // Set up kernel handle for noalias stub
-  KernelHandles[NoaliasStub->getName()] = NoaliasStub;
+  // Set up kernel handle for noalias stub - it should call the noalias device kernel
+  // Extract the device kernel name by removing the __device_stub__ prefix
+  std::string StubName = CGF.CurFn->getName().str();
+  std::string DeviceKernelName = StubName;
+  
+  // Remove __device_stub__ prefix if present
+  const std::string StubPrefix = "__device_stub__";
+  if (DeviceKernelName.find(StubPrefix) == 0) {
+    DeviceKernelName = DeviceKernelName.substr(StubPrefix.length());
+  }
+  
+  // Construct the noalias device kernel name
+  std::string NoaliasDeviceKernelName = DeviceKernelName + "_noalias";
+  
+  // Look for the noalias device kernel in the module
+  if (llvm::Function *NoaliasDeviceKernel = CGM.getModule().getFunction(NoaliasDeviceKernelName)) {
+    KernelHandles[NoaliasStub->getName()] = NoaliasDeviceKernel;
+  } else {
+    // Fallback to original kernel if noalias version not found
+    KernelHandles[NoaliasStub->getName()] = KernelHandles[CGF.CurFn->getName()];
+  }
   
   // Generate the function body for noalias stub
   {
@@ -612,6 +637,75 @@ void CGNVCUDARuntime::emitNoaliasDeviceStub(CodeGenFunction &CGF,
   
   // Register the noalias stub
   EmittedKernels.push_back({NoaliasStub, CGF.CurFuncDecl});
+}
+
+void CGNVCUDARuntime::emitConstDeviceStub(CodeGenFunction &CGF,
+                                          FunctionArgList &Args) {
+  // Create a new function for the const stub
+  std::string ConstStubName = CGF.CurFn->getName().str() + "_const";
+  llvm::FunctionType *FT = CGF.CurFn->getFunctionType();
+  llvm::Function *ConstStub = llvm::Function::Create(
+      FT, CGF.CurFn->getLinkage(), ConstStubName, CGM.getModule());
+  
+  // Copy attributes from original function
+  ConstStub->copyAttributesFrom(CGF.CurFn);
+  
+  // Set up kernel handle for const stub - it should call the const device kernel
+  // Extract the device kernel name by removing the __device_stub__ prefix
+  std::string StubName = CGF.CurFn->getName().str();
+  std::string DeviceKernelName = StubName;
+  
+  // Remove __device_stub__ prefix if present
+  const std::string StubPrefix = "__device_stub__";
+  if (DeviceKernelName.find(StubPrefix) == 0) {
+    DeviceKernelName = DeviceKernelName.substr(StubPrefix.length());
+  }
+  
+  // Construct the const device kernel name
+  std::string ConstDeviceKernelName = DeviceKernelName + "_const";
+  
+  // Look for the const device kernel in the module
+  if (llvm::Function *ConstDeviceKernel = CGM.getModule().getFunction(ConstDeviceKernelName)) {
+    KernelHandles[ConstStub->getName()] = ConstDeviceKernel;
+  } else {
+    // Fallback to original kernel if const version not found
+    KernelHandles[ConstStub->getName()] = KernelHandles[CGF.CurFn->getName()];
+  }
+  
+  // Generate the function body for const stub
+  {
+    CodeGenFunction ConstCGF(CGM);
+    FunctionArgList ConstArgs;
+    
+    // Copy argument list
+    for (const auto &Arg : Args) {
+      auto *NewArg = ParmVarDecl::Create(
+          CGM.getContext(), nullptr, Arg->getInnerLocStart(), Arg->getLocation(),
+          Arg->getIdentifier(), Arg->getType(), Arg->getTypeSourceInfo(),
+          Arg->getStorageClass(), nullptr);
+      ConstArgs.push_back(NewArg);
+    }
+    
+    // Start function generation
+    const CGFunctionInfo &FI = CGM.getTypes().arrangeBuiltinFunctionDeclaration(
+        CGM.getContext().VoidTy, ConstArgs);
+    ConstCGF.StartFunction(GlobalDecl(), CGM.getContext().VoidTy, ConstStub, FI,
+                          ConstArgs, SourceLocation(), SourceLocation());
+    
+    // Generate the same stub logic as the original
+    if (CudaFeatureEnabled(CGM.getTarget().getSDKVersion(),
+                           CudaFeature::CUDA_USES_NEW_LAUNCH) ||
+        (CGF.getLangOpts().HIP && CGF.getLangOpts().HIPUseNewLaunchAPI) ||
+        (CGF.getLangOpts().OffloadViaLLVM))
+      emitDeviceStubBodyNew(ConstCGF, ConstArgs);
+    else
+      emitDeviceStubBodyLegacy(ConstCGF, ConstArgs);
+    
+    ConstCGF.FinishFunction();
+  }
+  
+  // Register the const stub
+  EmittedKernels.push_back({ConstStub, CGF.CurFuncDecl});
 }
 
 // Replace the original variable Var with the address loaded from variable
@@ -699,21 +793,19 @@ llvm::Function *CGNVCUDARuntime::makeRegisterGlobalsFn() {
   for (auto &&I : EmittedKernels) {
     std::string DeviceKernelName = getDeviceSideName(cast<NamedDecl>(I.D));
     
-    // If this kernel was generated with noalias optimization, we need to register it
-    // with the noalias device kernel name
+    // If this is a noalias stub, register it with the noalias device kernel name
     if (CGM.getCodeGenOpts().CudaKernelNoalias) {
-      // Check if this kernel has pointer parameters
-      bool hasPointerParams = false;
-      if (const FunctionDecl *FD = cast<FunctionDecl>(I.D)) {
-        for (const ParmVarDecl *Param : FD->parameters()) {
-          if (Param->getType()->isPointerType()) {
-            hasPointerParams = true;
-            break;
-          }
-        }
-      }
-      if (hasPointerParams) {
+      std::string StubName = I.Kernel->getName().str();
+      if (StubName.find("_noalias") != std::string::npos) {
         DeviceKernelName += "_noalias";
+      }
+    }
+    
+    // If this is a const stub, register it with the const device kernel name
+    if (CGM.getCodeGenOpts().CudaKernelConst) {
+      std::string StubName = I.Kernel->getName().str();
+      if (StubName.find("_const") != std::string::npos) {
+        DeviceKernelName += "_const";
       }
     }
     

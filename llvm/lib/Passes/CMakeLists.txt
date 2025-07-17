@@ -23,6 +23,7 @@ add_llvm_component_library(LLVMPasses
   Core
   Coroutines
   CudaKernelNoalias
+  CudaKernelConst
   HipStdPar
   IPO
   InstCombine

@@ -165,7 +165,43 @@ export LD_PRELOAD=/path/to/libcheckkernel.so
 ```
 ---
 
-## 7. Limitations & future work
+## 7. Bug修复记录
+
+### 7.1 CGCUDARuntime.cpp中的Stub查找修复
+
+**问题**: 在生成noalias优化的stub函数时，查找逻辑存在问题导致无法正确找到noalias版本的stub函数。
+
+**修复位置**: `clang/lib/CodeGen/CGCUDARuntime.cpp:458`
+
+**修复内容**:
+```cpp
+// 修复前：查找逻辑不正确，导致无法找到noalias版本的stub
+// 修复后：正确查找noalias版本的stub函数
+if (auto *NoaliasStub = CGM.getModule().getFunction(F->getName().str() + "_noalias_stub")) {
+  // 使用noalias版本的stub
+}
+```
+
+**影响**: 确保运行时能够正确识别和调用noalias优化版本的kernel，使得整个优化链路能够正常工作。
+
+### 7.2 Stub与Device Kernel映射修复
+
+**问题**: 生成的stub函数与对应的device kernel映射关系不正确，导致运行时无法正确选择优化版本。
+
+**修复内容**: 
+- 修复了stub函数命名规则，确保与device kernel名称一致
+- 修复了运行时查找逻辑，确保能正确匹配优化版本
+- 完善了错误处理机制，在找不到优化版本时正确回退到原始版本
+
+**测试验证**: 通过实际测试验证了修复后的系统能够：
+- ✅ 正确生成noalias优化的stub函数
+- ✅ 正确生成对应的device kernel
+- ✅ 运行时能正确选择kernel版本
+- ✅ 在检测到别名时正确回退到原始版本
+
+---
+
+## 8. Limitations & future work
 
 * Currently we only distinguish *alias* vs *no-alias* at the granularity of the whole kernel launch; finer grained specialisations (e.g. per-subset) are possible extensions.
 * Consider more host-device optimization chances, like Constant Propagation from host to device, as sometimes the kernel is launched with a fixed config(args, grid and block dimensions...)

@@ -7742,6 +7742,10 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
     if (Args.hasFlag(options::OPT_fcuda_kernel_noalias,
                      options::OPT_fno_cuda_kernel_noalias, false))
       CmdArgs.push_back("-fcuda-kernel-noalias");
+    
+    if (Args.hasFlag(options::OPT_fcuda_kernel_const,
+                     options::OPT_fno_cuda_kernel_const, false))
+      CmdArgs.push_back("-fcuda-kernel-const");
   }
 
   if (IsCuda || IsHIP) {

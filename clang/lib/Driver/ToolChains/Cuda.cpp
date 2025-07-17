@@ -867,6 +867,10 @@ void CudaToolChain::addClangTargetOptions(
                          options::OPT_fno_cuda_kernel_noalias, false))
     CC1Args.push_back("-fcuda-kernel-noalias");
 
+  if (DriverArgs.hasFlag(options::OPT_fcuda_kernel_const,
+                         options::OPT_fno_cuda_kernel_const, false))
+    CC1Args.push_back("-fcuda-kernel-const");
+
   if (!DriverArgs.hasFlag(options::OPT_offloadlib, options::OPT_no_offloadlib,
                           true))
     return;

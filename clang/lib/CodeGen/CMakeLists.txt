@@ -8,6 +8,7 @@ set(LLVM_LINK_COMPONENTS
   Coroutines
   Coverage
   CudaKernelNoalias
+  CudaKernelConst
   Demangle
   Extensions
   FrontendDriver
