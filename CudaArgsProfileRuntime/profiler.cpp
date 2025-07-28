@@ -98,7 +98,7 @@ void parse_and_add_value(json& param_info, char* data_addr) {
     }
 }
 
-extern "C" void __cuda_profile_kernel_launch(const char* kernel_name, int arg_count, void** arg_values, const char* arg_info_json_str) {
+extern "C" void __cuda_profile_kernel_launch(const char* kernel_name, int arg_count, void** arg_values, const char* arg_info_json_str, void* grid_dim, void* block_dim) {
     const char* json_path_env = std::getenv("CUDA_ARGS_PROFILE_JSON_FILE");
     if (!json_path_env) return;
     std::string json_path = json_path_env;
@@ -151,6 +151,11 @@ extern "C" void __cuda_profile_kernel_launch(const char* kernel_name, int arg_co
         }
     }
     kernel_launch_info["params"] = params_with_values;
+
+    dim3* grid = static_cast<dim3*>(grid_dim);
+    kernel_launch_info["grid"] = {grid->x, grid->y, grid->z};
+    dim3* block = static_cast<dim3*>(block_dim);
+    kernel_launch_info["block"] = {block->x, block->y, block->z};
 
     root["kernels"].push_back(kernel_launch_info);
 

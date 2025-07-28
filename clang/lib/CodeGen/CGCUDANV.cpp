@@ -427,55 +427,6 @@ void CGNVCUDARuntime::emitDeviceStubBodyNew(CodeGenFunction &CGF,
                            ? prepareKernelArgsLLVMOffload(CGF, Args)
                            : prepareKernelArgs(CGF, Args);
 
-  // Call the external profiler function to dump argument values at runtime.
-  {
-    llvm::json::Object KernelInfo;
-    KernelInfo["name"] = CGF.CurFn->getName();
-    llvm::json::Array ArgList;
-    for (unsigned i = 0; i < Args.size(); ++i) {
-      const VarDecl *VD = Args[i];
-      llvm::json::Object ArgInfo;
-      ArgInfo["index"] = i;
-      ArgInfo["name"] = VD->getName();
-      ArgInfo["type"] = VD->getType().getAsString();
-      ArgInfo["size"] = CGM.getContext().getTypeSize(VD->getType()) / 8;
-
-      if (const auto *RD = VD->getType()->getAsRecordDecl()) {
-        if (const auto *Def = RD->getDefinition()) {
-          llvm::json::Array Members;
-          populateStructArgInfo(Members, Def);
-          if (!Members.empty())
-            ArgInfo["members"] = std::move(Members);
-        }
-      }
-      ArgList.push_back(std::move(ArgInfo));
-    }
-    KernelInfo["params"] = std::move(ArgList);
-
-    std::string ArgInfoJsonStr;
-    llvm::raw_string_ostream OS(ArgInfoJsonStr);
-    OS << llvm::json::Value(std::move(KernelInfo));
-    OS.flush();
-
-    // void __cuda_profile_kernel_launch(const char*, int, void**, const char*);
-    llvm::Type *ProfilerParams[] = {PtrTy, IntTy, PtrTy, PtrTy};
-    llvm::FunctionCallee ProfilerFn = CGM.CreateRuntimeFunction(
-        llvm::FunctionType::get(VoidTy, ProfilerParams, false),
-        "__cuda_profile_kernel_launch");
-
-    if (auto* F = dyn_cast<llvm::Function>(ProfilerFn.getCallee()))
-        F->setLinkage(llvm::GlobalValue::WeakAnyLinkage);
-
-    llvm::Constant *KernelNameStr =
-        makeConstantString(std::string(CGF.CurFn->getName()));
-    llvm::Constant *ArgInfoJson = makeConstantString(ArgInfoJsonStr);
-
-    llvm::Value *CallArgs[] = {
-        KernelNameStr, llvm::ConstantInt::get(IntTy, Args.size()),
-        KernelArgs.emitRawPointer(CGF), ArgInfoJson};
-    CGF.Builder.CreateCall(ProfilerFn, CallArgs);
-  }
-
   llvm::BasicBlock *EndBlock = CGF.createBasicBlock("setup.end");
 
   // Lookup cudaLaunchKernel/hipLaunchKernel function.
@@ -535,6 +486,56 @@ void CGNVCUDARuntime::emitDeviceStubBodyNew(CodeGenFunction &CGF,
                                                 BlockDim.emitRawPointer(CGF),
                                                 ShmemSize.emitRawPointer(CGF),
                                                 Stream.emitRawPointer(CGF)});
+
+  // Call the external profiler function to dump argument values at runtime.
+  {
+    llvm::json::Object KernelInfo;
+    KernelInfo["name"] = CGF.CurFn->getName();
+    llvm::json::Array ArgList;
+    for (unsigned i = 0; i < Args.size(); ++i) {
+      const VarDecl *VD = Args[i];
+      llvm::json::Object ArgInfo;
+      ArgInfo["index"] = i;
+      ArgInfo["name"] = VD->getName();
+      ArgInfo["type"] = VD->getType().getAsString();
+      ArgInfo["size"] = CGM.getContext().getTypeSize(VD->getType()) / 8;
+
+      if (const auto *RD = VD->getType()->getAsRecordDecl()) {
+        if (const auto *Def = RD->getDefinition()) {
+          llvm::json::Array Members;
+          populateStructArgInfo(Members, Def);
+          if (!Members.empty())
+            ArgInfo["members"] = std::move(Members);
+        }
+      }
+      ArgList.push_back(std::move(ArgInfo));
+    }
+    KernelInfo["params"] = std::move(ArgList);
+
+    std::string ArgInfoJsonStr;
+    llvm::raw_string_ostream OS(ArgInfoJsonStr);
+    OS << llvm::json::Value(std::move(KernelInfo));
+    OS.flush();
+
+    // void __cuda_profile_kernel_launch(const char*, int, void**, const char*, void*, void*);
+    llvm::Type *ProfilerParams[] = {PtrTy, IntTy, PtrTy, PtrTy, PtrTy, PtrTy};
+    llvm::FunctionCallee ProfilerFn = CGM.CreateRuntimeFunction(
+        llvm::FunctionType::get(VoidTy, ProfilerParams, false),
+        "__cuda_profile_kernel_launch");
+
+    if (auto* F = dyn_cast<llvm::Function>(ProfilerFn.getCallee()))
+        F->setLinkage(llvm::GlobalValue::WeakAnyLinkage);
+
+    llvm::Constant *KernelNameStr =
+        makeConstantString(std::string(CGF.CurFn->getName()));
+    llvm::Constant *ArgInfoJson = makeConstantString(ArgInfoJsonStr);
+
+    llvm::Value *CallArgs[] = {
+        KernelNameStr, llvm::ConstantInt::get(IntTy, Args.size()),
+        KernelArgs.emitRawPointer(CGF), ArgInfoJson,
+        GridDim.emitRawPointer(CGF), BlockDim.emitRawPointer(CGF)};
+    CGF.Builder.CreateCall(ProfilerFn, CallArgs);
+  }
 
   // Emit the call to cudaLaunch
   llvm::Value *Kernel =
