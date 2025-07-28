@@ -395,13 +395,15 @@ void CGNVCUDARuntime::populateStructArgInfo(llvm::json::Array &Members,
                                             const RecordDecl *RD) {
   if (!RD || !RD->getDefinition()) return;
 
+  const ASTRecordLayout &Layout = CGM.getContext().getASTRecordLayout(RD);
   unsigned FieldIndex = 0;
   for (const FieldDecl *FD : RD->fields()) {
     llvm::json::Object MemberInfo;
-    MemberInfo["index"] = FieldIndex++;
+    MemberInfo["index"] = FieldIndex;
     MemberInfo["name"] = FD->getName();
     MemberInfo["type"] = FD->getType().getAsString();
     MemberInfo["size"] = CGM.getContext().getTypeSize(FD->getType()) / 8;
+    MemberInfo["offset"] = Layout.getFieldOffset(FieldIndex) / 8;
 
     if (const auto *MemberRD = FD->getType()->getAsRecordDecl()) {
       if (const auto *Def = MemberRD->getDefinition()) {
@@ -412,6 +414,7 @@ void CGNVCUDARuntime::populateStructArgInfo(llvm::json::Array &Members,
       }
     }
     Members.push_back(std::move(MemberInfo));
+    FieldIndex++;
   }
 }
 
@@ -419,38 +422,59 @@ void CGNVCUDARuntime::populateStructArgInfo(llvm::json::Array &Members,
 // array and kernels are launched using cudaLaunchKernel().
 void CGNVCUDARuntime::emitDeviceStubBodyNew(CodeGenFunction &CGF,
                                             FunctionArgList &Args) {
-  // Collect argument info for JSON dump if requested.
-  if (!KernelArgsInfo.getArray("kernels"))
-      KernelArgsInfo["kernels"] = llvm::json::Array();
-
-  llvm::json::Object KernelInfo;
-  KernelInfo["name"] = CGF.CurFn->getName();
-  llvm::json::Array ArgList;
-  for (unsigned i = 0; i < Args.size(); ++i) {
-    const VarDecl *VD = Args[i];
-    llvm::json::Object ArgInfo;
-    ArgInfo["index"] = i;
-    ArgInfo["name"] = VD->getName();
-    ArgInfo["type"] = VD->getType().getAsString();
-    ArgInfo["size"] = CGM.getContext().getTypeSize(VD->getType()) / 8;
-
-    if (const auto *RD = VD->getType()->getAsRecordDecl()) {
-      if (const auto *Def = RD->getDefinition()) {
-          llvm::json::Array Members;
-          populateStructArgInfo(Members, Def);
-          if (!Members.empty())
-            ArgInfo["members"] = std::move(Members);
-      }
-    }
-    ArgList.push_back(std::move(ArgInfo));
-  }
-  KernelInfo["params"] = std::move(ArgList);
-  KernelArgsInfo.getArray("kernels")->push_back(std::move(KernelInfo));
-
   // Build the shadow stack entry at the very start of the function.
   Address KernelArgs = CGF.getLangOpts().OffloadViaLLVM
                            ? prepareKernelArgsLLVMOffload(CGF, Args)
                            : prepareKernelArgs(CGF, Args);
+
+  // Call the external profiler function to dump argument values at runtime.
+  {
+    llvm::json::Object KernelInfo;
+    KernelInfo["name"] = CGF.CurFn->getName();
+    llvm::json::Array ArgList;
+    for (unsigned i = 0; i < Args.size(); ++i) {
+      const VarDecl *VD = Args[i];
+      llvm::json::Object ArgInfo;
+      ArgInfo["index"] = i;
+      ArgInfo["name"] = VD->getName();
+      ArgInfo["type"] = VD->getType().getAsString();
+      ArgInfo["size"] = CGM.getContext().getTypeSize(VD->getType()) / 8;
+
+      if (const auto *RD = VD->getType()->getAsRecordDecl()) {
+        if (const auto *Def = RD->getDefinition()) {
+          llvm::json::Array Members;
+          populateStructArgInfo(Members, Def);
+          if (!Members.empty())
+            ArgInfo["members"] = std::move(Members);
+        }
+      }
+      ArgList.push_back(std::move(ArgInfo));
+    }
+    KernelInfo["params"] = std::move(ArgList);
+
+    std::string ArgInfoJsonStr;
+    llvm::raw_string_ostream OS(ArgInfoJsonStr);
+    OS << llvm::json::Value(std::move(KernelInfo));
+    OS.flush();
+
+    // void __cuda_profile_kernel_launch(const char*, int, void**, const char*);
+    llvm::Type *ProfilerParams[] = {PtrTy, IntTy, PtrTy, PtrTy};
+    llvm::FunctionCallee ProfilerFn = CGM.CreateRuntimeFunction(
+        llvm::FunctionType::get(VoidTy, ProfilerParams, false),
+        "__cuda_profile_kernel_launch");
+
+    if (auto* F = dyn_cast<llvm::Function>(ProfilerFn.getCallee()))
+        F->setLinkage(llvm::GlobalValue::WeakAnyLinkage);
+
+    llvm::Constant *KernelNameStr =
+        makeConstantString(std::string(CGF.CurFn->getName()));
+    llvm::Constant *ArgInfoJson = makeConstantString(ArgInfoJsonStr);
+
+    llvm::Value *CallArgs[] = {
+        KernelNameStr, llvm::ConstantInt::get(IntTy, Args.size()),
+        KernelArgs.emitRawPointer(CGF), ArgInfoJson};
+    CGF.Builder.CreateCall(ProfilerFn, CallArgs);
+  }
 
   llvm::BasicBlock *EndBlock = CGF.createBasicBlock("setup.end");
 
@@ -1310,25 +1334,6 @@ void CGNVCUDARuntime::createOffloadingEntries() {
 
 // Returns module constructor to be added.
 llvm::Function *CGNVCUDARuntime::finalizeModule() {
-  const char *JsonPathEnv = std::getenv("CUDA_ARGS_PROFILE_JSON_FILE");
-  std::string OutputPath = JsonPathEnv ? std::string(JsonPathEnv) : "kernel_args.json";
-
-  if (KernelArgsInfo.getArray("kernels") && !OutputPath.empty()) {
-    std::string S;
-    llvm::raw_string_ostream OS(S);
-    OS << llvm::formatv("{0:2}", llvm::json::Value(std::move(KernelArgsInfo)));
-    OS.flush();
-
-    std::error_code EC;
-    llvm::raw_fd_ostream FileOS(OutputPath, EC, llvm::sys::fs::OF_None);
-    if (EC) {
-      llvm::errs() << "Error opening " << OutputPath
-                   << " for writing: " << EC.message() << "\n";
-    } else {
-      FileOS << S;
-    }
-  }
-
   transformManagedVars();
   if (CGM.getLangOpts().CUDAIsDevice) {
     // Mark ODR-used device variables as compiler used to prevent it from being

@@ -1,0 +1,163 @@
+#include "profiler.h"
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <vector>
+#include <cstdlib>
+#include <memory>
+#include "json.hpp"
+#include <sys/file.h>
+#include <unistd.h>
+#include <cuda_runtime.h>
+#include <unordered_map>
+#include <dlfcn.h>
+using json = nlohmann::json;
+
+// 保存原始的cudaMalloc函数指针
+static cudaError_t (*original_cudaMalloc)(void **, size_t) = nullptr;
+
+// global map to store the address and size of the allocated memory
+std::unordered_map<void*, size_t> memory_map;
+
+// 初始化函数，获取原始cudaMalloc函数指针
+static void init_original_functions() {
+    if (!original_cudaMalloc) {
+        // 获取原始cudaMalloc函数指针
+        original_cudaMalloc = (cudaError_t (*)(void **, size_t))dlsym(RTLD_NEXT, "cudaMalloc");
+        if (!original_cudaMalloc) {
+            std::cerr << "Failed to get original cudaMalloc function" << std::endl;
+        }
+    }
+}
+
+// Hook cudaMalloc函数
+extern "C" cudaError_t cudaMalloc(void **devPtr, size_t size) {
+    // 确保原始函数指针已初始化
+    init_original_functions();
+    
+    if (!original_cudaMalloc) {
+        return cudaErrorUnknown;
+    }
+    
+    // 调用原始cudaMalloc函数
+    cudaError_t err = original_cudaMalloc(devPtr, size);
+    if (err == cudaSuccess) {
+        memory_map[*devPtr] = size;
+    }
+    return err;
+}
+
+// Forward declaration
+void parse_and_add_value(json& param_info, char* data_addr);
+
+// Parses members of a struct, creating a new JSON array for the "value"
+void parse_struct_members(json& members_array, char* struct_base_addr) {
+    for (auto& member_info : members_array) {
+        size_t offset = member_info["offset"].get<size_t>();
+        parse_and_add_value(member_info, struct_base_addr + offset);
+    }
+}
+
+// Main recursive parsing function. It takes a JSON object containing the type info
+// and adds a "value" field to it.
+void parse_and_add_value(json& param_info, char* data_addr) {
+    std::string type = param_info["type"].get<std::string>();
+
+    if (param_info.contains("members")) {
+        // It's a struct. The data_addr is the base address of the struct.
+        json members_copy = param_info["members"];
+        parse_struct_members(members_copy, data_addr);
+        param_info["value"] = members_copy;
+        param_info.erase("members"); // Remove original members array, as it's now under "value"
+    } else if (type.find('*') != std::string::npos) {
+        // It's a pointer. The data_addr points to the pointer value.
+        void* ptr_value = *reinterpret_cast<void**>(data_addr);
+        char hex_buf[20];
+        sprintf(hex_buf, "%p", ptr_value);
+        if (memory_map.find(ptr_value) != memory_map.end()) {
+            param_info["size"] = memory_map[ptr_value];
+        }
+        param_info["value"] = hex_buf;
+    } else {
+        // It's a scalar. The data_addr points to the value.
+        if (type == "int") {
+            param_info["value"] = *reinterpret_cast<int*>(data_addr);
+        } else if (type == "float") {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%.7g", *reinterpret_cast<float*>(data_addr));
+            param_info["value"] = std::stod(buf);
+        } else if (type == "double") {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%.15g", *reinterpret_cast<double*>(data_addr));
+            param_info["value"] = std::stod(buf);
+        } else if (type == "char") {
+            param_info["value"] = *reinterpret_cast<char*>(data_addr);
+        } else {
+            param_info["value"] = "unsupported_scalar_type";
+        }
+    }
+}
+
+extern "C" void __cuda_profile_kernel_launch(const char* kernel_name, int arg_count, void** arg_values, const char* arg_info_json_str) {
+    const char* json_path_env = std::getenv("CUDA_ARGS_PROFILE_JSON_FILE");
+    if (!json_path_env) return;
+    std::string json_path = json_path_env;
+
+    int fd = open(json_path.c_str(), O_CREAT | O_RDWR, 0666);
+    if (fd == -1) {
+        std::cerr << "Profiler: Error opening or creating file: " << json_path << std::endl;
+        return;
+    }
+    if (flock(fd, LOCK_EX) == -1) {
+        std::cerr << "Profiler: Error locking file: " << json_path << std::endl;
+        close(fd);
+        return;
+    }
+
+    json root;
+    std::ifstream read_file(json_path);
+    if (read_file.peek() != std::ifstream::traits_type::eof()) {
+        try {
+            root = json::parse(read_file, nullptr, false);
+            if (root.is_discarded()) { // Handle parse error
+              root = json::object();
+            }
+        } catch (json::parse_error& e) {
+            root = json::object();
+        }
+    }
+    read_file.close();
+
+    if (!root.contains("kernels") || !root["kernels"].is_array()) {
+        root["kernels"] = json::array();
+    }
+
+    json kernel_launch_info = json::parse(arg_info_json_str, nullptr, false);
+     if (kernel_launch_info.is_discarded()) {
+        std::cerr << "Profiler: Failed to parse kernel info JSON" << std::endl;
+        flock(fd, LOCK_UN);
+        close(fd);
+        return;
+    }
+
+    kernel_launch_info["id"] = root["kernels"].size();
+
+    json params_with_values = json::array();
+    if(kernel_launch_info.contains("params") && kernel_launch_info["params"].is_array()){
+        for (int i = 0; i < arg_count; ++i) {
+            json param_info = kernel_launch_info["params"][i];
+            parse_and_add_value(param_info, static_cast<char*>(arg_values[i]));
+            params_with_values.push_back(param_info);
+        }
+    }
+    kernel_launch_info["params"] = params_with_values;
+
+    root["kernels"].push_back(kernel_launch_info);
+
+    std::ofstream write_file(json_path, std::ios::trunc);
+    write_file << root.dump(2);
+    write_file.close();
+
+    flock(fd, LOCK_UN);
+    close(fd);
+}
