@@ -1,4 +1,5 @@
 #include "profiler.h"
+#include "process_profile.h"
 #include <iostream>
 #include <fstream>
 #include <string>
@@ -11,7 +12,97 @@
 #include <cuda_runtime.h>
 #include <unordered_map>
 #include <dlfcn.h>
+
 using json = nlohmann::json;
+
+#include "profiler.h"
+#include "process_profile.h"
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <vector>
+#include <cstdlib>
+#include <memory>
+#include <mutex>
+#include "json.hpp"
+#include <sys/file.h>
+#include <unistd.h>
+#include <cuda_runtime.h>
+#include <unordered_map>
+#include <dlfcn.h>
+
+using json = nlohmann::json;
+
+// Global JSON object to store all kernel launch data
+static json profile_data;
+static std::mutex profile_data_mutex;
+
+// This function will be called at exit to write the file.
+void write_profile_data() {
+    const char* json_path_env = std::getenv("CUDA_ARGS_PROFILE_JSON_FILE");
+    if (!json_path_env) return;
+    std::string json_path = json_path_env;
+
+    const char* append_env = std::getenv("CUDA_ARGS_PROFILE_APPEND");
+    bool append = (append_env && std::string(append_env) == "1");
+
+    json final_root;
+
+    int fd = open(json_path.c_str(), O_CREAT | O_RDWR, 0666);
+    if (fd == -1) {
+        std::cerr << "Profiler: Error opening or creating file: " << json_path << std::endl;
+        return;
+    }
+    if (flock(fd, LOCK_EX) == -1) {
+        std::cerr << "Profiler: Error locking file: " << json_path << std::endl;
+        close(fd);
+        return;
+    }
+
+    if (append) {
+        std::ifstream read_file(json_path);
+        if (read_file.peek() != std::ifstream::traits_type::eof()) {
+            try {
+                final_root = json::parse(read_file, nullptr, false);
+                if (final_root.is_discarded()) { // Handle parse error
+                  final_root = json::object();
+                }
+            } catch (json::parse_error& e) {
+                final_root = json::object();
+            }
+        }
+        read_file.close();
+    }
+
+    std::lock_guard<std::mutex> lock(profile_data_mutex);
+    if (!final_root.contains("kernels") || !final_root["kernels"].is_array()) {
+        final_root["kernels"] = json::array();
+    }
+    for (const auto& launch : profile_data["kernels"]) {
+        final_root["kernels"].push_back(launch);
+    }
+
+    std::ofstream write_file(json_path, std::ios::trunc);
+    write_file << final_root.dump(2);
+    write_file.close();
+
+    flock(fd, LOCK_UN);
+    close(fd);
+
+    process_profile_data();
+}
+
+namespace {
+
+struct ProfilerExitHandler {
+    ProfilerExitHandler() {
+        atexit(write_profile_data);
+    }
+};
+
+ProfilerExitHandler exit_handler;
+
+} // namespace
 
 // 保存原始的cudaMalloc函数指针
 static cudaError_t (*original_cudaMalloc)(void **, size_t) = nullptr;
@@ -99,48 +190,18 @@ void parse_and_add_value(json& param_info, char* data_addr) {
 }
 
 extern "C" void __cuda_profile_kernel_launch(const char* kernel_name, int arg_count, void** arg_values, const char* arg_info_json_str, void* grid_dim, void* block_dim) {
-    const char* json_path_env = std::getenv("CUDA_ARGS_PROFILE_JSON_FILE");
-    if (!json_path_env) return;
-    std::string json_path = json_path_env;
-
-    int fd = open(json_path.c_str(), O_CREAT | O_RDWR, 0666);
-    if (fd == -1) {
-        std::cerr << "Profiler: Error opening or creating file: " << json_path << std::endl;
-        return;
-    }
-    if (flock(fd, LOCK_EX) == -1) {
-        std::cerr << "Profiler: Error locking file: " << json_path << std::endl;
-        close(fd);
-        return;
-    }
-
-    json root;
-    std::ifstream read_file(json_path);
-    if (read_file.peek() != std::ifstream::traits_type::eof()) {
-        try {
-            root = json::parse(read_file, nullptr, false);
-            if (root.is_discarded()) { // Handle parse error
-              root = json::object();
-            }
-        } catch (json::parse_error& e) {
-            root = json::object();
-        }
-    }
-    read_file.close();
-
-    if (!root.contains("kernels") || !root["kernels"].is_array()) {
-        root["kernels"] = json::array();
+    std::lock_guard<std::mutex> lock(profile_data_mutex);
+    if (!profile_data.contains("kernels") || !profile_data["kernels"].is_array()) {
+        profile_data["kernels"] = json::array();
     }
 
     json kernel_launch_info = json::parse(arg_info_json_str, nullptr, false);
      if (kernel_launch_info.is_discarded()) {
         std::cerr << "Profiler: Failed to parse kernel info JSON" << std::endl;
-        flock(fd, LOCK_UN);
-        close(fd);
         return;
     }
 
-    kernel_launch_info["id"] = root["kernels"].size();
+    kernel_launch_info["id"] = profile_data["kernels"].size();
 
     json params_with_values = json::array();
     if(kernel_launch_info.contains("params") && kernel_launch_info["params"].is_array()){
@@ -157,12 +218,5 @@ extern "C" void __cuda_profile_kernel_launch(const char* kernel_name, int arg_co
     dim3* block = static_cast<dim3*>(block_dim);
     kernel_launch_info["block"] = {block->x, block->y, block->z};
 
-    root["kernels"].push_back(kernel_launch_info);
-
-    std::ofstream write_file(json_path, std::ios::trunc);
-    write_file << root.dump(2);
-    write_file.close();
-
-    flock(fd, LOCK_UN);
-    close(fd);
+    profile_data["kernels"].push_back(kernel_launch_info);
 }

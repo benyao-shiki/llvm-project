@@ -4,7 +4,7 @@ project(CudaArgsProfileRuntime)
 # 查找CUDA
 find_package(CUDA REQUIRED)
 
-add_library(CudaArgsProfileRuntime SHARED profiler.cpp)
+add_library(CudaArgsProfileRuntime SHARED profiler.cpp process_profile.cpp)
 
 target_include_directories(CudaArgsProfileRuntime PUBLIC 
     ${CMAKE_CURRENT_SOURCE_DIR}
