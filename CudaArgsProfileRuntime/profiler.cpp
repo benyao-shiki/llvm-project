@@ -104,36 +104,173 @@ ProfilerExitHandler exit_handler;
 
 } // namespace
 
-// 保存原始的cudaMalloc函数指针
+// 保存原始的CUDA函数指针
 static cudaError_t (*original_cudaMalloc)(void **, size_t) = nullptr;
+static cudaError_t (*original_cudaFree)(void *) = nullptr;
+static cudaError_t (*original_cudaMemcpy)(void *, const void *, size_t, cudaMemcpyKind) = nullptr;
+static cudaError_t (*original_cudaMemcpyAsync)(void *, const void *, size_t, cudaMemcpyKind, cudaStream_t) = nullptr;
+static cudaError_t (*original_cudaMallocHost)(void **, size_t) = nullptr;
+static cudaError_t (*original_cudaFreeHost)(void *) = nullptr;
+static cudaError_t (*original_cudaMallocManaged)(void **, size_t, unsigned int) = nullptr;
 
 // global map to store the address and size of the allocated memory
 std::unordered_map<void*, size_t> memory_map;
+// 记录内存类型（device, host, managed）
+std::unordered_map<void*, std::string> memory_type_map;
 
-// 初始化函数，获取原始cudaMalloc函数指针
+// 初始化函数，获取原始CUDA函数指针
 static void init_original_functions() {
     if (!original_cudaMalloc) {
-        // 获取原始cudaMalloc函数指针
         original_cudaMalloc = (cudaError_t (*)(void **, size_t))dlsym(RTLD_NEXT, "cudaMalloc");
         if (!original_cudaMalloc) {
             std::cerr << "Failed to get original cudaMalloc function" << std::endl;
+        }
+    }
+    
+    if (!original_cudaFree) {
+        original_cudaFree = (cudaError_t (*)(void *))dlsym(RTLD_NEXT, "cudaFree");
+        if (!original_cudaFree) {
+            std::cerr << "Failed to get original cudaFree function" << std::endl;
+        }
+    }
+    
+    if (!original_cudaMemcpy) {
+        original_cudaMemcpy = (cudaError_t (*)(void *, const void *, size_t, cudaMemcpyKind))dlsym(RTLD_NEXT, "cudaMemcpy");
+        if (!original_cudaMemcpy) {
+            std::cerr << "Failed to get original cudaMemcpy function" << std::endl;
+        }
+    }
+    
+    if (!original_cudaMemcpyAsync) {
+        original_cudaMemcpyAsync = (cudaError_t (*)(void *, const void *, size_t, cudaMemcpyKind, cudaStream_t))dlsym(RTLD_NEXT, "cudaMemcpyAsync");
+        if (!original_cudaMemcpyAsync) {
+            std::cerr << "Failed to get original cudaMemcpyAsync function" << std::endl;
+        }
+    }
+    
+    if (!original_cudaMallocHost) {
+        original_cudaMallocHost = (cudaError_t (*)(void **, size_t))dlsym(RTLD_NEXT, "cudaMallocHost");
+        if (!original_cudaMallocHost) {
+            std::cerr << "Failed to get original cudaMallocHost function" << std::endl;
+        }
+    }
+    
+    if (!original_cudaFreeHost) {
+        original_cudaFreeHost = (cudaError_t (*)(void *))dlsym(RTLD_NEXT, "cudaFreeHost");
+        if (!original_cudaFreeHost) {
+            std::cerr << "Failed to get original cudaFreeHost function" << std::endl;
+        }
+    }
+    
+    if (!original_cudaMallocManaged) {
+        original_cudaMallocManaged = (cudaError_t (*)(void **, size_t, unsigned int))dlsym(RTLD_NEXT, "cudaMallocManaged");
+        if (!original_cudaMallocManaged) {
+            std::cerr << "Failed to get original cudaMallocManaged function" << std::endl;
         }
     }
 }
 
 // Hook cudaMalloc函数
 extern "C" cudaError_t cudaMalloc(void **devPtr, size_t size) {
-    // 确保原始函数指针已初始化
     init_original_functions();
     
     if (!original_cudaMalloc) {
         return cudaErrorUnknown;
     }
     
-    // 调用原始cudaMalloc函数
     cudaError_t err = original_cudaMalloc(devPtr, size);
     if (err == cudaSuccess) {
         memory_map[*devPtr] = size;
+        memory_type_map[*devPtr] = "device";
+    }
+    return err;
+}
+
+// Hook cudaFree函数
+extern "C" cudaError_t cudaFree(void *devPtr) {
+    init_original_functions();
+    
+    if (!original_cudaFree) {
+        return cudaErrorUnknown;
+    }
+    
+    cudaError_t err = original_cudaFree(devPtr);
+    if (err == cudaSuccess) {
+        memory_map.erase(devPtr);
+        memory_type_map.erase(devPtr);
+    }
+    return err;
+}
+
+// Hook cudaMemcpy函数
+extern "C" cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, cudaMemcpyKind kind) {
+    init_original_functions();
+    
+    if (!original_cudaMemcpy) {
+        return cudaErrorUnknown;
+    }
+    
+    // 记录内存拷贝信息（可选）
+    // 这里可以添加内存拷贝的统计信息
+    
+    return original_cudaMemcpy(dst, src, count, kind);
+}
+
+// Hook cudaMemcpyAsync函数
+extern "C" cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count, cudaMemcpyKind kind, cudaStream_t stream) {
+    init_original_functions();
+    
+    if (!original_cudaMemcpyAsync) {
+        return cudaErrorUnknown;
+    }
+    
+    return original_cudaMemcpyAsync(dst, src, count, kind, stream);
+}
+
+// Hook cudaMallocHost函数
+extern "C" cudaError_t cudaMallocHost(void **ptr, size_t size) {
+    init_original_functions();
+    
+    if (!original_cudaMallocHost) {
+        return cudaErrorUnknown;
+    }
+    
+    cudaError_t err = original_cudaMallocHost(ptr, size);
+    if (err == cudaSuccess) {
+        memory_map[*ptr] = size;
+        memory_type_map[*ptr] = "host";
+    }
+    return err;
+}
+
+// Hook cudaFreeHost函数
+extern "C" cudaError_t cudaFreeHost(void *ptr) {
+    init_original_functions();
+    
+    if (!original_cudaFreeHost) {
+        return cudaErrorUnknown;
+    }
+    
+    cudaError_t err = original_cudaFreeHost(ptr);
+    if (err == cudaSuccess) {
+        memory_map.erase(ptr);
+        memory_type_map.erase(ptr);
+    }
+    return err;
+}
+
+// Hook cudaMallocManaged函数
+extern "C" cudaError_t cudaMallocManaged(void **devPtr, size_t size, unsigned int flags) {
+    init_original_functions();
+    
+    if (!original_cudaMallocManaged) {
+        return cudaErrorUnknown;
+    }
+    
+    cudaError_t err = original_cudaMallocManaged(devPtr, size, flags);
+    if (err == cudaSuccess) {
+        memory_map[*devPtr] = size;
+        memory_type_map[*devPtr] = "managed";
     }
     return err;
 }
@@ -167,6 +304,7 @@ void parse_and_add_value(json& param_info, char* data_addr) {
         sprintf(hex_buf, "%p", ptr_value);
         if (memory_map.find(ptr_value) != memory_map.end()) {
             param_info["size"] = memory_map[ptr_value];
+            param_info["memory_type"] = memory_type_map[ptr_value];
         }
         param_info["value"] = hex_buf;
     } else {
