@@ -55,6 +55,7 @@ add_llvm_component_library(LLVMAnalysis
   CaptureTracking.cpp
   CmpInstAnalysis.cpp
   CostModel.cpp
+  CudaKernelAnalysis.cpp
   CodeMetrics.cpp
   ConstantFolding.cpp
   CtxProfAnalysis.cpp

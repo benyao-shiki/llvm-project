@@ -286,6 +286,7 @@ CGSCC_PASS_WITH_PARAMS(
 #ifndef FUNCTION_ANALYSIS
 #define FUNCTION_ANALYSIS(NAME, CREATE_PASS)
 #endif
+FUNCTION_ANALYSIS("cuda-kernel-analysis", CudaKernelAnalysis())
 FUNCTION_ANALYSIS("aa", AAManager())
 FUNCTION_ANALYSIS("access-info", LoopAccessAnalysis())
 FUNCTION_ANALYSIS("assumptions", AssumptionAnalysis())
