@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <regex>
 #include "json.hpp"
 #include <sys/file.h>
 #include <unistd.h>
@@ -318,6 +319,36 @@ const MemoryRegion* findMemoryRegion(void* ptr) {
 // Forward declaration
 void parse_and_add_value(json& param_info, char* data_addr);
 
+// New helper to parse array types like "int[3]"
+bool parse_array_type(const std::string& type, std::string& base_type, int& count) {
+    static std::regex re(R"((.*?)\s*\[\s*(\d+)\s*\])");
+    std::smatch match;
+    if (std::regex_match(type, match, re)) {
+        base_type = match[1].str();
+        count = std::stoi(match[2].str());
+        return true;
+    }
+    return false;
+}
+
+// helper to get scalar values of various types
+json get_scalar_value(const std::string& type, char* data_addr) {
+    if (type == "int") return *reinterpret_cast<int*>(data_addr);
+    if (type == "float") return *reinterpret_cast<float*>(data_addr);
+    if (type == "double") return *reinterpret_cast<double*>(data_addr);
+    if (type == "char") return *reinterpret_cast<char*>(data_addr);
+    if (type == "short") return *reinterpret_cast<short*>(data_addr);
+    if (type == "long") return *reinterpret_cast<long*>(data_addr);
+    if (type == "long long") return *reinterpret_cast<long long*>(data_addr);
+    if (type == "unsigned char") return *reinterpret_cast<unsigned char*>(data_addr);
+    if (type == "unsigned short") return *reinterpret_cast<unsigned short*>(data_addr);
+    if (type == "unsigned int") return *reinterpret_cast<unsigned int*>(data_addr);
+    if (type == "unsigned long") return *reinterpret_cast<unsigned long*>(data_addr);
+    if (type == "unsigned long long") return *reinterpret_cast<unsigned long long*>(data_addr);
+    if (type == "bool" || type == "_Bool") return *reinterpret_cast<bool*>(data_addr);
+    return "unsupported_scalar_type";
+}
+
 // Parses members of a struct, creating a new JSON array for the "value"
 void parse_struct_members(json& members_array, char* struct_base_addr) {
     for (auto& member_info : members_array) {
@@ -330,53 +361,48 @@ void parse_struct_members(json& members_array, char* struct_base_addr) {
 // and adds a "value" field to it.
 void parse_and_add_value(json& param_info, char* data_addr) {
     std::string type = param_info["type"].get<std::string>();
+    size_t size = param_info.value("size", 0);
 
-    if (param_info.contains("members")) {
-        // It's a struct. The data_addr is the base address of the struct.
+    std::string base_type;
+    int count;
+
+    if (parse_array_type(type, base_type, count)) {
+        // It's an array
+        json arr = json::array();
+        if (count > 0) {
+            size_t element_size = size / count;
+            if (element_size > 0) {
+                for (int i = 0; i < count; ++i) {
+                    arr.push_back(get_scalar_value(base_type, data_addr + i * element_size));
+                }
+            }
+        }
+        param_info["value"] = arr;
+    } else if (param_info.contains("members")) {
+        // It's a struct
         json members_copy = param_info["members"];
         parse_struct_members(members_copy, data_addr);
         param_info["value"] = members_copy;
-        param_info.erase("members"); // Remove original members array, as it's now under "value"
+        param_info.erase("members");
     } else if (type.find('*') != std::string::npos) {
-        // It's a pointer. The data_addr points to the pointer value.
+        // It's a pointer
         void* ptr_value = *reinterpret_cast<void**>(data_addr);
         char hex_buf[20];
         sprintf(hex_buf, "%p", ptr_value);
-        
-        // 首先尝试精确匹配
-        if (memory_map.find(ptr_value) != memory_map.end()) {
-            param_info["size"] = memory_map[ptr_value];
-            param_info["memory_type"] = memory_type_map[ptr_value];
-        } else {
-            // 如果精确匹配失败，尝试查找内存区域
-            const MemoryRegion* region = findMemoryRegion(ptr_value);
-            if (region) {
-                param_info["size"] = region->getRemainingSize(ptr_value);
-                param_info["memory_type"] = region->type;
-                char base_addr_buf[20];
-                sprintf(base_addr_buf, "%p", region->base_addr);
-                param_info["base_address"] = base_addr_buf;
-                param_info["offset"] = region->getOffset(ptr_value);
-            }
-        }
         param_info["value"] = hex_buf;
-    } else {
-        // It's a scalar. The data_addr points to the value.
-        if (type == "int") {
-            param_info["value"] = *reinterpret_cast<int*>(data_addr);
-        } else if (type == "float") {
-            char buf[32];
-            snprintf(buf, sizeof(buf), "%.7g", *reinterpret_cast<float*>(data_addr));
-            param_info["value"] = std::stod(buf);
-        } else if (type == "double") {
-            char buf[32];
-            snprintf(buf, sizeof(buf), "%.15g", *reinterpret_cast<double*>(data_addr));
-            param_info["value"] = std::stod(buf);
-        } else if (type == "char") {
-            param_info["value"] = *reinterpret_cast<char*>(data_addr);
-        } else {
-            param_info["value"] = "unsupported_scalar_type";
+
+        const MemoryRegion* region = findMemoryRegion(ptr_value);
+        if (region) {
+            param_info["size"] = region->getRemainingSize(ptr_value);
+            param_info["memory_type"] = region->type;
+            char base_addr_buf[20];
+            sprintf(base_addr_buf, "%p", region->base_addr);
+            param_info["base_address"] = base_addr_buf;
+            param_info["offset"] = region->getOffset(ptr_value);
         }
+    } else {
+        // It's a scalar
+        param_info["value"] = get_scalar_value(type, data_addr);
     }
 }
 

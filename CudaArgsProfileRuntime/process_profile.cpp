@@ -44,12 +44,15 @@ struct ScalarIdentifier {
 };
 
 void find_common_scalars_recursive(const json& param, const std::string& name_prefix, int param_index, int member_index, std::map<ScalarIdentifier, std::map<json, int>>& scalar_counts) {
+    if (!param.is_object() || !param.contains("name")) return;
     std::string current_name = name_prefix + param["name"].get<std::string>();
-    if (param.contains("value") && param["value"].is_array()) { // It's a struct
+
+    // Check if the value is an array of objects (struct members) or a simple array (C-style array value)
+    if (param.contains("value") && param["value"].is_array() && !param["value"].empty() && param["value"].front().is_object()) {
         for (size_t i = 0; i < param["value"].size(); ++i) {
             find_common_scalars_recursive(param["value"][i], current_name + ".", param_index, i, scalar_counts);
         }
-    } else if (param["type"].get<std::string>().find('*') == std::string::npos) { // It's a scalar
+    } else if (param["type"].get<std::string>().find('*') == std::string::npos) { // It's a scalar or a C-style array of scalars
         ScalarIdentifier id;
         id.param_index = param_index;
         id.member_index = member_index;
@@ -123,8 +126,11 @@ struct PointerParameter {
 };
 
 void find_pointers_recursive(const json& param, const std::string& name_prefix, int top_level_index, int member_index, std::vector<PointerParameter>& pointers) {
+    if (!param.is_object() || !param.contains("name")) return;
     std::string current_name = name_prefix + param["name"].get<std::string>();
-    if (param.contains("value") && param["value"].is_array()) { // It's a struct
+
+    // Check if the value is an array of objects (struct members) or a simple value
+    if (param.contains("value") && param["value"].is_array() && !param["value"].empty() && param["value"].front().is_object()) {
         for (size_t i = 0; i < param["value"].size(); ++i) {
             find_pointers_recursive(param["value"][i], current_name + ".", top_level_index, i, pointers);
         }
@@ -133,7 +139,7 @@ void find_pointers_recursive(const json& param, const std::string& name_prefix, 
         p.name = current_name;
         p.top_level_index = top_level_index;
         p.member_index = member_index;
-        if (param["value"].is_string()) {
+        if (param.contains("value") && param["value"].is_string()) {
             std::string val_str = param["value"].get<std::string>();
             if (val_str.rfind("0x", 0) == 0) {
                 p.address = std::stoull(val_str, nullptr, 16);

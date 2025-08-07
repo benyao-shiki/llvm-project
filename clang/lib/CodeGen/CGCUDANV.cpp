@@ -395,26 +395,69 @@ void CGNVCUDARuntime::populateStructArgInfo(llvm::json::Array &Members,
                                             const RecordDecl *RD) {
   if (!RD || !RD->getDefinition()) return;
 
-  const ASTRecordLayout &Layout = CGM.getContext().getASTRecordLayout(RD);
-  unsigned FieldIndex = 0;
-  for (const FieldDecl *FD : RD->fields()) {
-    llvm::json::Object MemberInfo;
-    MemberInfo["index"] = FieldIndex;
-    MemberInfo["name"] = FD->getName();
-    MemberInfo["type"] = FD->getType().getAsString();
-    MemberInfo["size"] = CGM.getContext().getTypeSize(FD->getType()) / 8;
-    MemberInfo["offset"] = Layout.getFieldOffset(FieldIndex) / 8;
+  // Helper lambda to recursively process a class and its bases.
+  unsigned FieldIndex = Members.size();
+  std::function<void(const CXXRecordDecl*, uint64_t)> process_cxx_record =
+      [&](const CXXRecordDecl *CXXRD, uint64_t BaseOffsetBits) {
+    if (!CXXRD) return;
 
-    if (const auto *MemberRD = FD->getType()->getAsRecordDecl()) {
-      if (const auto *Def = MemberRD->getDefinition()) {
-        llvm::json::Array NestedMembers;
-        populateStructArgInfo(NestedMembers, Def);
-        if (!NestedMembers.empty())
-          MemberInfo["members"] = std::move(NestedMembers);
+    // Process base classes first
+    for (const auto &Base : CXXRD->bases()) {
+      if (const auto *BaseDef = Base.getType()->getAsCXXRecordDecl()->getDefinition()) {
+        const ASTRecordLayout &Layout = CGM.getContext().getASTRecordLayout(CXXRD);
+        uint64_t BaseSubobjectOffsetBits = Layout.getBaseClassOffset(BaseDef).getQuantity() * 8;
+        process_cxx_record(BaseDef, BaseOffsetBits + BaseSubobjectOffsetBits);
       }
     }
-    Members.push_back(std::move(MemberInfo));
-    FieldIndex++;
+
+    // Process fields of the current class
+    const ASTRecordLayout &Layout = CGM.getContext().getASTRecordLayout(CXXRD);
+    for (const FieldDecl *FD : CXXRD->fields()) {
+      llvm::json::Object MemberInfo;
+      MemberInfo["index"] = FieldIndex++;
+      MemberInfo["name"] = FD->getName();
+      MemberInfo["type"] = FD->getType().getCanonicalType().getAsString();
+      MemberInfo["size"] = CGM.getContext().getTypeSize(FD->getType()) / 8;
+      uint64_t FieldOffsetBits = Layout.getFieldOffset(FD->getFieldIndex());
+      MemberInfo["offset"] = (BaseOffsetBits + FieldOffsetBits) / 8;
+
+      if (const auto *MemberRD = FD->getType()->getAsRecordDecl()) {
+        if (const auto *Def = MemberRD->getDefinition()) {
+          llvm::json::Array NestedMembers;
+          populateStructArgInfo(NestedMembers, Def); // Recurse for nested structs
+          if (!NestedMembers.empty())
+            MemberInfo["members"] = std::move(NestedMembers);
+        }
+      }
+      Members.push_back(std::move(MemberInfo));
+    }
+  };
+
+  if (const auto *CXXRD = dyn_cast<CXXRecordDecl>(RD)) {
+    process_cxx_record(CXXRD, 0);
+  } else {
+    // Original logic for C structs (no inheritance)
+    const ASTRecordLayout &Layout = CGM.getContext().getASTRecordLayout(RD);
+    unsigned FieldIndex = 0;
+    for (const FieldDecl *FD : RD->fields()) {
+      llvm::json::Object MemberInfo;
+      MemberInfo["index"] = FieldIndex;
+      MemberInfo["name"] = FD->getName();
+      MemberInfo["type"] = FD->getType().getCanonicalType().getAsString();
+      MemberInfo["size"] = CGM.getContext().getTypeSize(FD->getType()) / 8;
+      MemberInfo["offset"] = Layout.getFieldOffset(FieldIndex) / 8;
+
+      if (const auto *MemberRD = FD->getType()->getAsRecordDecl()) {
+        if (const auto *Def = MemberRD->getDefinition()) {
+          llvm::json::Array NestedMembers;
+          populateStructArgInfo(NestedMembers, Def);
+          if (!NestedMembers.empty())
+            MemberInfo["members"] = std::move(NestedMembers);
+        }
+      }
+      Members.push_back(std::move(MemberInfo));
+      FieldIndex++;
+    }
   }
 }
 
