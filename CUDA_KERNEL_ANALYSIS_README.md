@@ -1,174 +1,292 @@
 # CudaKernelAnalysis Pass
 
-## 概述
+## Overview
 
-CudaKernelAnalysis 是一个LLVM分析pass，专门用于分析CUDA内核函数的参数特性，为后续的优化pass提供决策依据。
+CudaKernelAnalysis is an LLVM analysis pass specifically designed to analyze CUDA kernel function parameters and their impact on kernel IR, providing decision-making basis for subsequent optimization passes.
 
-## 功能特性
+## Features
 
-### 1. CUDA内核识别
-- 通过 `ptx.kernel` 属性识别CUDA内核函数
-- 通过 `PTX_Kernel` 调用约定识别CUDA内核函数
-- 自动跳过非CUDA内核函数的分析
+### 1. CUDA Kernel Identification
+- Identifies CUDA kernel functions through `ptx.kernel` attribute
+- Identifies CUDA kernel functions through `PTX_Kernel` calling convention
+- Automatically skips analysis for non-CUDA kernel functions
 
-### 2. 标量参数权重分析
-分析标量参数（整数、浮点数）在控制流中的重要性：
-- **分支指令使用**：直接用于 `br` 或 `switch` 指令的参数权重 +10
-- **比较指令使用**：用于比较指令且结果用于分支的参数权重 +5
-- 权重越高表示参数在控制流中越重要
+### 2. Unified Parameter Analysis
+Analyzes all parameter types (scalars, pointers, and struct members) using a unified approach:
+- **Scalar parameters**: Integers and floating-point numbers
+- **Pointer parameters**: Pointer types for noalias analysis
+- **Struct members**: Individual members of struct parameters passed by value
+- **Nested structs**: Supports nested struct members with index tracking
 
-### 3. 指针参数noalias收益分析
-分析指针参数添加 `noalias` 属性的潜在收益：
-- 检查指针是否在循环中被使用
-- 如果在循环中使用，则认为添加 `noalias` 可能有益
+### 3. Weight-Based Analysis
+All parameters are analyzed using consistent weight calculation rules:
 
-## 使用方法
+#### Scalar Analysis (Control Flow Importance)
+- **Branch instruction usage**: Parameters directly used in `br` or `switch` instructions get weight +10
+- **Comparison instruction usage**: Parameters used in comparison instructions with results used in branches get weight +5
+- Higher weights indicate parameters are more important in control flow
 
-### 1. 基本使用
+#### Pointer Analysis (NoAlias Optimization Potential)
+- **Base usage**: +1 weight for being used in the function
+- **Loop usage**: +5 weight if used inside a loop
+- **Memory operations**: +3 weight for load/store operations
+- **Pointer arithmetic**: +2 weight for GEP operations
+- **Loop-invariant usage**: +2 weight if the pointer is loop-invariant
+- Higher weights indicate better candidates for `noalias` optimization
+
+## Usage
+
+### 1. Basic Usage
 
 ```bash
-# 在pass pipeline中使用
+# Use in pass pipeline
 ./bin/opt -passes='require<cuda-kernel-analysis>' -disable-output input.ll
 
-# 获取调试输出
+# Get debug output
 ./bin/opt -passes='require<cuda-kernel-analysis>' -debug-only=cuda-kernel-analysis -disable-output input.ll
 ```
 
-### 2. 与其他pass配合使用
+### 2. Using with Other Passes
 
 ```bash
-# 在transform pass之前使用
+# Use before transform passes
 ./bin/opt -passes='require<cuda-kernel-analysis>,your-transform-pass' input.ll
 
-# 在多个pass中使用
+# Use with multiple passes
 ./bin/opt -passes='require<cuda-kernel-analysis>,cuda-kernel-noalias,cuda-kernel-const' input.ll
 ```
 
-### 3. 调试选项
+### 3. Debug Options
 
 ```bash
-# 启用所有调试输出
+# Enable all debug output
 ./bin/opt -debug -passes='require<cuda-kernel-analysis>' input.ll
 
-# 只启用cuda-kernel-analysis的调试输出
+# Enable only cuda-kernel-analysis debug output
 ./bin/opt -debug-only=cuda-kernel-analysis -passes='require<cuda-kernel-analysis>' input.ll
 ```
 
-## 输出示例
+## Output Examples
 
-### 调试输出示例
+### Debug Output Example
 
 ```
 CudaKernelAnalysis: Analyzing CUDA kernel function 'my_cuda_kernel'
-  Pointer argument 'data': noalias benefit = true
+  Pointer argument 'data': weight = 11
   Scalar argument 'size': weight = 10
   Scalar argument 'threshold': weight = 5
+  Struct argument 'config': analyzing 3 members
 CudaKernelAnalysis: Analysis completed for function 'my_cuda_kernel'
 ```
 
-### 非CUDA内核函数
+### Non-CUDA Kernel Function
 
 ```
 CudaKernelAnalysis: Function 'normal_function' is not a CUDA kernel, skipping analysis
 ```
 
-## 分析结果
+## Analysis Results
 
-### CudaKernelAnalysisResult 结构
+### CudaKernelAnalysisResult Structure
 
 ```cpp
 class CudaKernelAnalysisResult {
-  // 标量参数权重映射
-  DenseMap<const Argument *, int> ScalarWeights;
+  // A map from scalar parameter info to its weight
+  DenseMap<ParameterInfo, int> ScalarWeights;
   
-  // 指针参数noalias收益映射
-  DenseMap<const Argument *, bool> PointerBenefits;
+  // A map from pointer parameter info to its weight
+  DenseMap<ParameterInfo, int> PointerWeights;
   
-  // 调试输出标志
+  // Debug output flag
   bool DebugOutput;
+  
+  // Helper method
+  SmallVector<std::pair<ParameterInfo, int>, 16> getAllParametersSorted() const;
+};
+
+struct ParameterInfo {
+  std::string Name;                    // Parameter name
+  const Argument *Arg;                 // Pointer to the original argument
+  SmallVector<unsigned, 4> Indices;    // Member indices (length 1 for regular args, >1 for struct members)
+  
+  std::string getDisplayName() const;  // Get formatted display name
+  bool isStructMember() const;         // Check if this is a struct member
+  unsigned getArgIndex() const;        // Get the argument index
 };
 ```
 
-### 在其他pass中使用
+### Using in Other Passes
 
 ```cpp
-// 获取分析结果
+// Get analysis results
 auto &Result = FAM.getResult<CudaKernelAnalysis>(F);
 
-// 使用标量权重
-for (auto [Arg, Weight] : Result.ScalarWeights) {
+// Access scalar parameters
+for (auto [Param, Weight] : Result.ScalarWeights) {
   if (Weight > 5) {
-    // 高权重参数的处理逻辑
+    // Process high-weight scalar parameters
+    // Param.getDisplayName() gives formatted name like "size" or "config[0]"
+    // Param.getArgIndex() gives the argument index (0, 1, 2, etc.)
+    // Param.isStructMember() tells if this is a struct member
   }
 }
 
-// 使用指针收益信息
-for (auto [Arg, Benefit] : Result.PointerBenefits) {
-  if (Benefit) {
-    // 添加noalias属性的逻辑
+// Access pointer parameters
+for (auto [Param, Weight] : Result.PointerWeights) {
+  if (Weight > 8) {
+    // Add noalias attributes to high-weight pointer parameters
   }
+}
+
+// Get all parameters sorted by weight
+auto SortedParams = Result.getAllParametersSorted();
+for (auto [Param, Weight] : SortedParams) {
+  // Process parameters in weight order
+}
+
+// Access parameter information
+for (auto [Param, Weight] : Result.ScalarWeights) {
+  // Param.Name - parameter name
+  // Param.Arg - pointer to original argument
+  // Param.Indices - member indices (e.g., [0] for first arg, [1,2] for second arg's third member)
+  // Param.getDisplayName() - formatted name like "data" or "config[0][1]"
+  // Param.isStructMember() - true if indices length > 1
+  // Param.getArgIndex() - first element of indices
 }
 ```
 
-## 示例CUDA内核
+## Example CUDA Kernel
 
 ```llvm
-define void @my_cuda_kernel(i32* %data, i32 %size, i32 %threshold) #0 {
+%struct.Config = type { i32, %struct.Nested, i32* }
+%struct.Nested = type { float, i32 }
+
+define void @my_cuda_kernel(i32* %data, i32 %size, %struct.Config %config) #0 {
 entry:
-  %0 = icmp sgt i32 %size, 0          ; size参数用于比较
-  br i1 %0, label %loop, label %exit  ; 比较结果用于分支
+  %0 = extractvalue %struct.Config %config, 0  ; Extract size field
+  %1 = icmp sgt i32 %0, 0                      ; size field used in comparison
+  br i1 %1, label %loop, label %exit           ; comparison result used in branch
 
 loop:
   %i = phi i32 [ 0, %entry ], [ %i.next, %loop.latch ]
-  %val = load i32, i32* %data, align 4  ; data指针在循环中使用
-  %cmp = icmp slt i32 %val, %threshold  ; threshold参数用于比较
-  br i1 %cmp, label %if.then, label %if.else  ; 比较结果用于分支
-  ; ... 更多代码
+  %2 = extractvalue %struct.Config %config, 1  ; Extract nested struct
+  %3 = extractvalue %struct.Nested %2, 0       ; Extract float field
+  %4 = extractvalue %struct.Config %config, 2  ; Extract pointer field
+  %val = load i32, i32* %4, align 4            ; pointer used in loop
+  %cmp = icmp slt i32 %val, %0                 ; size field used in comparison
+  br i1 %cmp, label %if.then, label %if.else   ; comparison result used in branch
+  ; ... more code
 }
 
 attributes #0 = { "ptx.kernel"="true" }
 ```
 
-分析结果：
-- `data` (指针): noalias benefit = true (在循环中使用)
-- `size` (标量): weight = 10 (直接用于分支)
-- `threshold` (标量): weight = 5 (用于比较且结果用于分支)
+Analysis Results:
+- `data` (pointer): weight = 11 (base: 1, loop: 5, load: 3, loop-invariant: 2)
+- `size` (scalar): weight = 10 (direct branch usage)
+- `config[0]` (scalar): weight = 10 (extractvalue + comparison + branch)
+- `config[1][0]` (scalar): weight = 0 (no significant usage)
+- `config[2]` (pointer): weight = 11 (extractvalue + loop + load + loop-invariant)
 
-## 编译和安装
+Index System:
+- `data`: indices = [0] (first argument)
+- `size`: indices = [1] (second argument)
+- `config[0]`: indices = [2, 0] (third argument, first member)
+- `config[1][0]`: indices = [2, 1, 0] (third argument, second member, first sub-member)
+- `config[2]`: indices = [2, 2] (third argument, third member)
 
-### 编译LLVM
+## Implementation Details
+
+### Key Functions
+
+#### `analyzeScalarValue(const Value *V, Function &F, FunctionAnalysisManager &AM)`
+- Generic function to analyze any scalar value (arguments or extracted values)
+- Returns weight based on usage in branches and comparisons
+- Higher weights for direct branch usage
+
+#### `analyzePointerValue(const Value *V, Function &F, FunctionAnalysisManager &AM)`
+- Generic function to analyze any pointer value (arguments or extracted values)
+- Considers loop usage, memory operations, and loop-invariant properties
+- Returns comprehensive weight for noalias decision making
+
+#### `analyzeStructMembers(const Argument &A, unsigned ArgIndex, Function &F, FunctionAnalysisManager &AM, ...)`
+- Recursively analyzes struct parameters passed by value
+- Tracks `extractvalue` instructions to identify member usage
+- Supports nested structs with index tracking
+- Applies scalar and pointer analysis rules to individual members
+
+### ParameterInfo Features
+
+#### Index System
+- All parameters have indices, even regular arguments
+- Regular arguments: indices = [ArgIndex] (length 1)
+- Struct members: indices = [ArgIndex, MemberIndex, ...] (length > 1)
+- Example: `[1, 2, 3]` means second argument, third member, fourth sub-member
+
+#### Display Names
+- `getDisplayName()` provides formatted names for debugging
+- Regular args: `"data"`, `"size"`
+- Struct members: `"config[0]"`, `"config[1][2]"`
+
+#### Helper Methods
+- `isStructMember()`: returns true if indices length > 1
+- `getArgIndex()`: returns the first element of indices (argument index)
+
+## Compilation and Installation
+
+### Compile LLVM
 
 ```bash
-# 在LLVM源码目录中
+# In LLVM source directory
 mkdir build && cd build
 cmake -G Ninja -DLLVM_ENABLE_PROJECTS="clang;lld" -DCMAKE_BUILD_TYPE=Release ../llvm
 ninja
 ```
 
-### 验证安装
+### Verify Installation
 
 ```bash
-# 检查pass是否可用
+# Check if pass is available
 ./bin/opt --print-passes | grep cuda-kernel-analysis
 
-# 测试pass功能
+# Test pass functionality
 ./bin/opt -passes='require<cuda-kernel-analysis>' -debug-only=cuda-kernel-analysis -disable-output test.ll
 ```
 
-## 注意事项
+## Notes
 
-1. **性能影响**：分析pass只在需要时运行，不会影响正常编译性能
-2. **调试输出**：使用 `-debug-only=cuda-kernel-analysis` 可以获取详细的调试信息
-3. **依赖关系**：该pass依赖 `LoopAnalysis` 来分析指针在循环中的使用情况
-4. **兼容性**：支持所有LLVM支持的CUDA内核识别方式
+1. **Performance Impact**: Analysis pass only runs when needed, doesn't affect normal compilation performance
+2. **Debug Output**: Use `-debug-only=cuda-kernel-analysis` for detailed debug information
+3. **Dependencies**: This pass depends on `LoopAnalysis` to analyze pointer usage in loops
+4. **Compatibility**: Supports all LLVM-supported CUDA kernel identification methods
+5. **Struct Analysis**: Handles both named and anonymous struct types
+6. **Nested Structs**: Supports arbitrary nesting depth with index tracking
+7. **Index System**: All parameters have indices for consistent representation
+8. **Separate Maps**: Scalar and pointer parameters are stored in separate maps for easy access
 
-## 扩展性
+## Extensibility
 
-该pass设计为可扩展的：
-- 可以添加更多的权重计算规则
-- 可以扩展noalias收益分析算法
-- 可以添加其他类型的参数分析
+The pass is designed to be extensible:
+- Can add more weight calculation rules
+- Can extend noalias analysis algorithms
+- Can add other types of parameter analysis
+- Can enhance struct member name resolution using debug information
+- Can add support for array parameters
+- Can extend index tracking for more complex data structures
 
-## 贡献
+## Test Cases
 
-欢迎提交issue和pull request来改进这个pass的功能和性能。
+The pass includes comprehensive test cases covering:
+- Loop-based kernels with pointer and scalar parameters
+- Branch-based kernels with control flow dependencies
+- Mixed kernels with both loop and branch characteristics
+- Struct-based kernels with various member types
+- Nested struct kernels with complex member access patterns
+- Const-optimized versions of the same kernels
+
+Example test kernels:
+- `_Z11loop_kerneliPf`: Loop kernel with size and data parameters
+- `_Z13branch_kerneliPf`: Branch kernel with flag and data parameters  
+- `_Z12mixed_kerneliiPf`: Mixed kernel with size, flag, and data parameters
+- `_Z15struct_kernel_config`: Struct-based kernel with Config parameter
+- `_Z20nested_struct_kernel_config`: Nested struct kernel with complex member access
