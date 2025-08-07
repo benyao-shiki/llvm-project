@@ -21,9 +21,9 @@ int analyzeScalarValue(const Value *V, Function &F, FunctionAnalysisManager &AM)
   for (const User *U : V->users()) {
     if (const Instruction *I = dyn_cast<Instruction>(U)) {
       if (isa<BranchInst>(I) || isa<SwitchInst>(I)) {
-        weight += 10; // Higher weight for direct use in branches
+        weight += 10; // direct use in branches
       } else if (isa<CmpInst>(I)) {
-        // If the result of a comparison is used in a branch, it's important.
+        // result of a comparison is used in a branch
         for (const User *CmpUser : I->users()) {
           if (const Instruction *CmpI = dyn_cast<Instruction>(CmpUser)) {
             if (isa<BranchInst>(CmpI) || isa<SwitchInst>(CmpI)) {
@@ -48,22 +48,19 @@ int analyzePointerValue(const Value *V, Function &F, FunctionAnalysisManager &AM
   
   for (const User *U : V->users()) {
     if (const Instruction *I = dyn_cast<Instruction>(U)) {
-      // Base weight for being used in the function
-      weight += 1;
-      
-      // Higher weight if used inside a loop
+
+      // if used inside a loop
       if (LI.getLoopFor(I->getParent())) {
         weight += 5;
       }
       
-      // Additional weight for specific instruction types that benefit from noalias
       if (isa<LoadInst>(I) || isa<StoreInst>(I)) {
         weight += 3; // Memory operations benefit more from noalias
       } else if (isa<GetElementPtrInst>(I)) {
         weight += 2; // Pointer arithmetic operations
       }
       
-      // Check if the pointer is used in loop-invariant ways
+      //if used in loop-invariant ways
       if (const Loop *L = LI.getLoopFor(I->getParent())) {
         if (L->isLoopInvariant(V)) {
           weight += 2; // Loop-invariant pointers are good candidates for noalias
