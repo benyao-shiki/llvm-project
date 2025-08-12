@@ -428,6 +428,57 @@ extern "C" void __cuda_profile_kernel_launch(const char* kernel_name, int arg_co
             params_with_values.push_back(param_info);
         }
     }
+
+    // 计算同一次launch中顶层指针参数的别名关系（区间重叠即视为别名）
+    {
+        struct PtrRange { size_t idx; unsigned long long start; unsigned long long end; };
+        std::vector<PtrRange> ptrs;
+        ptrs.reserve(params_with_values.size());
+
+        for (size_t i = 0; i < params_with_values.size(); ++i) {
+            const auto& p = params_with_values[i];
+            if (!p.contains("type") || !p["type"].is_string()) continue;
+            const std::string t = p["type"].get<std::string>();
+            if (t.find('*') == std::string::npos) continue; // 仅顶层指针参数
+
+            // 需要有地址和size
+            if (!p.contains("value") || !p["value"].is_string()) continue;
+            if (!p.contains("size") || !p["size"].is_number_unsigned()) continue;
+
+            const std::string addr_str = p["value"].get<std::string>();
+            if (addr_str.rfind("0x", 0) != 0) continue;
+            unsigned long long addr = 0ULL;
+            try {
+                addr = std::stoull(addr_str, nullptr, 16);
+            } catch (...) {
+                continue;
+            }
+            unsigned long long sz = p["size"].get<unsigned long long>();
+            if (sz == 0ULL) continue;
+            ptrs.push_back(PtrRange{(size_t)i, addr, addr + sz});
+        }
+
+        // 默认alias=0，然后若检测到与任一其它指针重叠则置为1
+        for (size_t i = 0; i < params_with_values.size(); ++i) {
+            auto& p = params_with_values[i];
+            if (p.contains("type") && p["type"].is_string() && p["type"].get<std::string>().find('*') != std::string::npos) {
+                p["alias"] = 0;
+            }
+        }
+
+        for (size_t i = 0; i < ptrs.size(); ++i) {
+            for (size_t j = i + 1; j < ptrs.size(); ++j) {
+                const auto& a = ptrs[i];
+                const auto& b = ptrs[j];
+                // 区间[a.start, a.end) 与 [b.start, b.end) 是否重叠
+                if (std::max(a.start, b.start) < std::min(a.end, b.end)) {
+                    params_with_values[a.idx]["alias"] = 1;
+                    params_with_values[b.idx]["alias"] = 1;
+                }
+            }
+        }
+    }
+
     kernel_launch_info["params"] = params_with_values;
 
     dim3* grid = static_cast<dim3*>(grid_dim);
