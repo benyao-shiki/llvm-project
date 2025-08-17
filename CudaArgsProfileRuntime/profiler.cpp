@@ -406,7 +406,7 @@ void parse_and_add_value(json& param_info, char* data_addr) {
     }
 }
 
-extern "C" void __cuda_profile_kernel_launch(const char* kernel_name, int arg_count, void** arg_values, const char* arg_info_json_str, void* grid_dim, void* block_dim) {
+extern "C" void __cuda_profile_kernel_launch(const char* kernel_name, const char* device_side_name, int arg_count, void** arg_values, const char* arg_info_json_str, void* grid_dim, void* block_dim) {
     std::lock_guard<std::mutex> lock(profile_data_mutex);
     if (!profile_data.contains("kernels") || !profile_data["kernels"].is_array()) {
         profile_data["kernels"] = json::array();
@@ -419,6 +419,7 @@ extern "C" void __cuda_profile_kernel_launch(const char* kernel_name, int arg_co
     }
 
     kernel_launch_info["id"] = profile_data["kernels"].size();
+    kernel_launch_info["device_side_name"] = device_side_name;
 
     json params_with_values = json::array();
     if(kernel_launch_info.contains("params") && kernel_launch_info["params"].is_array()){

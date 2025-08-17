@@ -560,8 +560,11 @@ void CGNVCUDARuntime::emitDeviceStubBodyNew(CodeGenFunction &CGF,
     OS << llvm::json::Value(std::move(KernelInfo));
     OS.flush();
 
-    // void __cuda_profile_kernel_launch(const char*, int, void**, const char*, void*, void*);
-    llvm::Type *ProfilerParams[] = {PtrTy, IntTy, PtrTy, PtrTy, PtrTy, PtrTy};
+    std::string DeviceSideName = getDeviceSideName(cast<NamedDecl>(CGF.CurFuncDecl));
+    llvm::Constant *DeviceSideNameStr = makeConstantString(DeviceSideName);
+
+    // void __cuda_profile_kernel_launch(const char*, const char*, int, void**, const char*, void*, void*);
+    llvm::Type *ProfilerParams[] = {PtrTy, PtrTy, IntTy, PtrTy, PtrTy, PtrTy, PtrTy};
     llvm::FunctionCallee ProfilerFn = CGM.CreateRuntimeFunction(
         llvm::FunctionType::get(VoidTy, ProfilerParams, false),
         "__cuda_profile_kernel_launch");
@@ -574,7 +577,9 @@ void CGNVCUDARuntime::emitDeviceStubBodyNew(CodeGenFunction &CGF,
     llvm::Constant *ArgInfoJson = makeConstantString(ArgInfoJsonStr);
 
     llvm::Value *CallArgs[] = {
-        KernelNameStr, llvm::ConstantInt::get(IntTy, Args.size()),
+        KernelNameStr,
+        DeviceSideNameStr,
+        llvm::ConstantInt::get(IntTy, Args.size()),
         KernelArgs.emitRawPointer(CGF), ArgInfoJson,
         GridDim.emitRawPointer(CGF), BlockDim.emitRawPointer(CGF)};
     CGF.Builder.CreateCall(ProfilerFn, CallArgs);
