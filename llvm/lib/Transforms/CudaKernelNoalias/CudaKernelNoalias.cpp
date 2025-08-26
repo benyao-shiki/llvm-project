@@ -6,13 +6,17 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// This pass clones CUDA kernel functions to create noalias versions for
-// different pointer parameter combinations.
+// This pass clones CUDA kernel functions to create noalias versions based on
+// profile-guided selection of pointer arguments (including struct members).
+// It reads per-launch records from profile.kernels[] and computes the best
+// subset of pointer parameters that are frequently non-aliasing, then clones
+// the kernel and adds noalias attributes to the selected top-level parameters.
 //
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/CudaKernelNoalias/CudaKernelNoalias.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/IR/CallingConv.h"
 #include "llvm/IR/Constants.h"
@@ -30,70 +34,183 @@
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/ErrorOr.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Analysis/CudaKernelAnalysis.h"
 #include <algorithm>
-#include <fstream>
-#include <regex>
-#include <set>
 #include <string>
 #include <map>
+#include <cstdlib>
+#include <cstring>
+#include <cctype>
+#include <sys/file.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+
+namespace {
+struct FileLockGuard {
+  int Fd; bool Ok;
+  FileLockGuard(const std::string &Path) : Fd(-1), Ok(false) {
+    std::string LockPath = Path + ".lock";
+    Fd = ::open(LockPath.c_str(), O_CREAT | O_RDWR, 0666);
+    if (Fd != -1) {
+      int Ret;
+      do { Ret = ::flock(Fd, LOCK_EX); } while (Ret != 0 && errno == EINTR);
+      if (Ret == 0) Ok = true; else { ::close(Fd); Fd = -1; }
+    }
+  }
+  ~FileLockGuard() { if (Fd != -1) { ::flock(Fd, LOCK_UN); ::close(Fd); } }
+  bool acquired() const { return Ok; }
+};
+
+struct FileSharedLockGuard {
+  int Fd; bool Ok;
+  FileSharedLockGuard(const std::string &Path) : Fd(-1), Ok(false) {
+    std::string LockPath = Path + ".lock";
+    Fd = ::open(LockPath.c_str(), O_CREAT | O_RDWR, 0666);
+    if (Fd != -1) {
+      int Ret;
+      do { Ret = ::flock(Fd, LOCK_SH); } while (Ret != 0 && errno == EINTR);
+      if (Ret == 0) Ok = true; else { ::close(Fd); Fd = -1; }
+    }
+  }
+  ~FileSharedLockGuard() { if (Fd != -1) { ::flock(Fd, LOCK_UN); ::close(Fd); } }
+  bool acquired() const { return Ok; }
+};
+}
 
 using namespace llvm;
 
 #define DEBUG_TYPE "cuda-kernel-noalias"
 
-// Command-line option for specifying the profile JSON file path
+// Profile path (reuse existing option name for compatibility)
 static cl::opt<std::string> CudaProfilePath(
     "cuda-kernel-profile",
     cl::desc("Path to the CUDA kernel profile log file"),
-    cl::value_desc("filename"),
-    cl::init(""));
+    cl::value_desc("filename"), cl::init(""));
+
+static cl::opt<bool> CudaNoaliasDebug(
+    "cuda-kernel-noalias-debug",
+    cl::desc("Enable debug prints for CudaKernelNoalias pass"), cl::init(false));
+
+static cl::opt<std::string> CudaNoaliasSelectedOut(
+    "cuda-kernel-noalias-selected-out",
+    cl::desc("Write selected noalias parameters to JSON file for host-side"),
+    cl::value_desc("filename"), cl::init(""));
 
 // Return true if the given function is a PTX kernel entry
 static bool isKernelFunction(const Function &F) {
   return F.getCallingConv() == CallingConv::PTX_Kernel;
 }
 
-// Utility: check whether the function has an explicit NVVM "kernel" annotation
-static bool hasNVVMKernelAnnotation(const Function &F) {
-  const Module *M = F.getParent();
-  NamedMDNode *NMD = M->getNamedMetadata("nvvm.annotations");
-  if (!NMD)
-    return false;
+#if 0
+// Kernel launches profile for noalias (flattened pointer-path -> alias flag)
+struct KernelNoaliasProfile {
+  std::string name;
+  std::map<unsigned, std::string> argIndexToName; // optional for pretty output
+  std::vector<StringMap<int>> launches; // path -> alias (0 means no alias)
+};
 
-  for (unsigned i = 0, e = NMD->getNumOperands(); i != e; ++i) {
-    const MDNode *MD = NMD->getOperand(i);
-    if (MD->getNumOperands() < 3)
-      continue;
+// Selected item with full indices path
+struct SelectedNoaliasItem {
+  SmallVector<unsigned, 4> Indices; // full path, e.g. [arg, member, ...]
+  double Ratio = 0.0;
+};
 
-    if (auto *FMD = mdconst::dyn_extract_or_null<Function>(MD->getOperand(0))) {
-      if (FMD == &F) {
-        if (auto *Str = dyn_cast<MDString>(MD->getOperand(1))) {
-          if (Str->getString() == "kernel")
-            return true;
-        }
+static std::map<std::string, KernelNoaliasProfile> KernelProfiles;
+static std::map<std::string, std::vector<SelectedNoaliasItem>> SelectedByKernel;
+#endif
+
+// Helper: recursively collect pointer member paths and their alias flag into OutMap
+static void collectPointerAliases(const json::Object &Obj, unsigned ArgIndex,
+                                  StringMap<int> &OutMap) {
+  // This function is called for a top-level parameter from the profile.
+  bool isStruct = false;
+  if (auto ValueNode = Obj.get("value")) {
+    if (auto *Arr = ValueNode->getAsArray()) {
+      if (!Arr->empty() && (*Arr)[0].getAsObject()) {
+        isStruct = true;
       }
     }
   }
-  return false;
+
+  if (!isStruct) {
+    // It's a top-level pointer, not a struct.
+    if (auto Ty = Obj.getString("type")) {
+      if (Ty->contains('*')) {
+        int AliasFlag = -1;
+        if (auto A = Obj.get("alias")) {
+          if (auto AI = A->getAsInteger()) AliasFlag = (int)*AI;
+        }
+        std::string Key = std::to_string(ArgIndex);
+        OutMap[Key] = AliasFlag;
+        OutMap[Key + ".0"] = AliasFlag;
+      }
+    }
+    return;
+  }
+
+  // It's a struct. Use recursive logic to find member offsets.
+  std::function<void(const json::Object &, uint64_t)> recurse;
+  recurse = [&](const json::Object &CurrentObj, uint64_t BaseOffset) {
+    uint64_t CurrentOffset = BaseOffset;
+    if (auto RelOffset = CurrentObj.getInteger("offset")) {
+      CurrentOffset += *RelOffset;
+    }
+
+    // If it's a pointer type, record its alias info at the current offset.
+    if (auto Ty = CurrentObj.getString("type")) {
+      if (Ty->contains('*')) {
+        int AliasFlag = -1; // Default to unknown
+        if (auto A = CurrentObj.get("alias")) {
+          if (auto AI = A->getAsInteger()) AliasFlag = (int)*AI;
+        }
+        std::string Path = std::to_string(ArgIndex) + "." + std::to_string(CurrentOffset);
+        OutMap[Path] = AliasFlag;
+      }
+    }
+
+    // If the value is a struct (array of members), recurse.
+    if (auto ValueNode = CurrentObj.get("value")) {
+      if (auto MembersArr = ValueNode->getAsArray()) {
+        for (const json::Value &Elem : *MembersArr) {
+          if (auto *Child = Elem.getAsObject()) {
+            recurse(*Child, CurrentOffset);
+          }
+        }
+      }
+    }
+  };
+  recurse(Obj, 0);
 }
 
-// Parse the JSON profile log and populate KernelProfiles
+// Parse JSON profile launches (kernels[]) and build KernelProfiles
 bool CudaKernelNoaliasPass::parseProfileLog() {
-  if (CudaProfilePath.empty()) {
-    errs() << "Warning: No profile log file specified. Use -mllvm -cuda-kernel-profile=<file>\n";
+  KernelProfiles.clear();
+
+  auto getEffectiveProfilePath = []() -> std::string {
+    if (!CudaProfilePath.empty()) return CudaProfilePath;
+    if (const char *Env = std::getenv("CUDA_KERNEL_PROFILE")) return std::string(Env);
+    return std::string();
+  };
+
+  std::string EffectivePath = getEffectiveProfilePath();
+  if (EffectivePath.empty()) {
+    errs() << "Warning: No profile log file specified. Use -mllvm -cuda-kernel-profile=<file> or set CUDA_KERNEL_PROFILE\n";
     return false;
   }
 
-  ErrorOr<std::unique_ptr<MemoryBuffer>> BufferOrErr = MemoryBuffer::getFile(CudaProfilePath);
+  FileSharedLockGuard ReadLock(EffectivePath);
+
+  auto BufferOrErr = MemoryBuffer::getFile(EffectivePath);
   if (!BufferOrErr) {
-    errs() << "Error: Cannot open profile log file: " << CudaProfilePath << "\n";
+    errs() << "Error: Cannot open profile log file: " << EffectivePath << "\n";
     return false;
   }
 
   StringRef Content = BufferOrErr.get()->getBuffer();
-  Expected<json::Value> Parsed = json::parse(Content);
+  auto Parsed = json::parse(Content);
   if (!Parsed) {
-    errs() << "Error: Failed to parse JSON profile log\n";
+    errs() << "Error: Failed to parse JSON profile log: " << toString(Parsed.takeError()) << "\n";
     return false;
   }
 
@@ -103,83 +220,351 @@ bool CudaKernelNoaliasPass::parseProfileLog() {
     return false;
   }
 
-  json::Array *HotKernels = RootObj->getArray("hot_kernels");
-  if (!HotKernels) {
-    errs() << "Warning: No hot_kernels array in profile log\n";
-    return true; // Nothing to optimize – no hot kernels present
-  }
+  if (auto KernelsArr = RootObj->getArray("kernels")) {
+    for (json::Value &KVal : *KernelsArr) {
+      json::Object *KObj = KVal.getAsObject();
+      if (!KObj) continue;
+      auto NameVal = KObj->getString("device_side_name");
+      if (!NameVal)
+        NameVal = KObj->getString("name");
+      if (!NameVal) continue;
+      KernelNoaliasProfile &KP = KernelProfiles[NameVal->str()];
+      KP.name = NameVal->str();
 
-  for (json::Value &HKVal : *HotKernels) {
-    json::Object *HKObj = HKVal.getAsObject();
-    if (!HKObj)
-      continue;
-
-    auto NameVal = HKObj->getString("name");
-    if (!NameVal)
-      continue;
-
-    KernelProfile KP;
-    KP.name = *NameVal;
-
-    json::Array *NoaliasArr = HKObj->getArray("noalias_pointers");
-    if (NoaliasArr) {
-      for (json::Value &PtrVal : *NoaliasArr) {
-        json::Object *PtrObj = PtrVal.getAsObject();
-        if (!PtrObj)
-          continue;
-        auto ArgVal = PtrObj->get("arg");
-        if (!ArgVal)
-          continue;
-        if (auto ArgInt = ArgVal->getAsInteger()) {
-          PointerInfo PI;
-          PI.index = static_cast<unsigned>(*ArgInt);
-          KP.pointerParams.push_back(PI);
+      // record arg index to name (optional)
+      if (auto ParamsArr = KObj->getArray("params")) {
+        for (json::Value &PVal : *ParamsArr) {
+          if (json::Object *PObj = PVal.getAsObject()) {
+            if (auto IndexVal = PObj->get("index")) {
+              if (auto IndexInt = IndexVal->getAsInteger()) {
+                if (auto N = PObj->getString("name"))
+                  KP.argIndexToName[(unsigned)*IndexInt] = N->str();
+              }
+            }
+          }
         }
       }
-    }
 
-    if (!KP.pointerParams.empty())
-      KernelProfiles[KP.name] = std::move(KP);
+      // collect pointer alias flags per launch (flattened by path)
+      StringMap<int> LaunchMap;
+      if (auto ParamsArr = KObj->getArray("params")) {
+        for (json::Value &PVal : *ParamsArr) {
+          if (auto *PObj = PVal.getAsObject()) {
+            if (auto Index = PObj->getInteger("index")) {
+              collectPointerAliases(*PObj, *Index, LaunchMap);
+            }
+          }
+        }
+      }
+      if (!LaunchMap.empty()) KP.launches.push_back(std::move(LaunchMap));
+    }
+  }
+
+  if (CudaNoaliasDebug) {
+    dbgs() << "[CudaKernelNoalias] profile loaded from '" << EffectivePath
+           << "' kernels_parsed=" << KernelProfiles.size()
+           << "\n";
+    for (const auto &KV : KernelProfiles) {
+      dbgs() << "  - name='" << KV.first << "' launches=" << KV.second.launches.size() << "\n";
+    }
   }
 
   return true;
 }
 
-// Return the parameter indices that should receive the noalias attribute
-std::vector<unsigned> CudaKernelNoaliasPass::getNoAliasPointerIndices(const Function &F) {
-  std::vector<unsigned> NoAliasParams;
-  auto It = KernelProfiles.find(F.getName().str());
-  
-  if (It != KernelProfiles.end()) {
-    for (const auto &PI : It->second.pointerParams) {
-      NoAliasParams.push_back(PI.index);
-    }
-  }
-  
-  return NoAliasParams;
+// Build a string path from indices vector
+static std::string buildPath(const SmallVector<unsigned,4> &Idx) {
+  std::string P = std::to_string((int)Idx[0]);
+  for (size_t i = 1; i < Idx.size(); ++i) P += "." + std::to_string((int)Idx[i]);
+  return P;
 }
 
-static Function *cloneKernelWithNoalias(Function &OrigF, 
-                                      const std::vector<unsigned> &NoaliasParams,
-                                      const std::string &Suffix) {
-  ValueToValueMapTy VMap;
-  Function *ClonedF = CloneFunction(&OrigF, VMap);
-  
-  // Set new function name for the cloned variant
-  std::string NewName = OrigF.getName().str() + "_" + Suffix;
-  ClonedF->setName(NewName);
-  
-  // Add noalias attribute to the requested parameters
-  for (unsigned Idx : NoaliasParams) {
-    if (Idx < ClonedF->arg_size()) {
-      ClonedF->addParamAttr(Idx, Attribute::NoAlias);
+// Compute best subset per kernel using analysis weights and launches alias flags
+void CudaKernelNoaliasPass::computeBestSelections(Module &M, ModuleAnalysisManager &AM) {
+  SelectedByKernel.clear();
+
+  // Access FunctionAnalysisManager from ModuleAnalysisManager
+  auto &FAMProxy = AM.getResult<FunctionAnalysisManagerModuleProxy>(M);
+  FunctionAnalysisManager &FAM = FAMProxy.getManager();
+
+  for (Function &F : M) {
+    if (!isKernelFunction(F)) continue;
+
+    auto KIt = KernelProfiles.find(F.getName().str());
+    if (KIt == KernelProfiles.end()) {
+      if (CudaNoaliasDebug)
+        dbgs() << "[CudaKernelNoalias] skip kernel '" << F.getName()
+               << "': no profile entry\n";
+      continue;
+    }
+    const KernelNoaliasProfile &KP = KIt->second;
+    if (KP.launches.empty()) {
+      if (CudaNoaliasDebug)
+        dbgs() << "[CudaKernelNoalias] skip kernel '" << F.getName()
+               << "': profile launches empty\n";
+      continue;
+    }
+
+    // Candidates from analysis (pointer weights > 0), include struct members
+    auto AR = FAM.getResult<CudaKernelAnalysis>(F);
+    struct Candidate { SmallVector<unsigned,4> Indices; std::string Path; double Weight; };
+    std::vector<Candidate> Cands;
+    unsigned Eligible = 0;
+    for (const auto &Entry : AR.PointerWeights) {
+      const ParameterInfo &PI = Entry.first;
+      int W = Entry.second;
+      if (W <= 0) continue; else ++Eligible;
+      Candidate C;
+      C.Indices = PI.Indices;
+      C.Path = buildPath(C.Indices);
+      C.Weight = (double)W;
+      Cands.push_back(std::move(C));
+    }
+    if (CudaNoaliasDebug) {
+      dbgs() << "[CudaKernelNoalias] kernel='" << F.getName()
+             << "' analysis_candidates(pointer_weights>0)=" << Cands.size()
+             << " (total_pointer_entries=" << Eligible << ")\n";
+    }
+    if (Cands.empty()) continue;
+
+    // Enumerate non-empty subsets
+    const unsigned Num = Cands.size();
+    double BestScore = -1.0;
+    unsigned BestMask = 0;
+    SmallVector<SmallVector<unsigned,4>, 8> BestIdxPaths;
+    SmallVector<double, 8> BestSingleRatio;
+
+    for (unsigned Mask = 1; Mask < (1u << Num); ++Mask) {
+      SmallVector<std::string, 8> SubPaths;
+      SmallVector<double, 8> SubWeights;
+      SmallVector<SmallVector<unsigned,4>, 8> SubIdx;
+      for (unsigned i = 0; i < Num; ++i) if (Mask & (1u << i)) {
+        SubPaths.push_back(Cands[i].Path);
+        SubWeights.push_back(Cands[i].Weight);
+        SubIdx.push_back(Cands[i].Indices);
+      }
+
+      // Ratio: launch count where all selected paths exist and alias==0
+      size_t Sat = 0;
+      for (const auto &L : KP.launches) {
+        bool Ok = true;
+        for (const auto &P : SubPaths) {
+          auto It = L.find(P);
+          if (It == L.end()) { Ok = false; break; }
+          int AliasFlag = It->second;
+          if (AliasFlag != 0) { Ok = false; break; }
+        }
+        if (Ok) ++Sat;
+      }
+      double Ratio = KP.launches.empty() ? 0.0 : (double)Sat / (double)KP.launches.size();
+      double Score = 0.0; for (double W : SubWeights) Score += W * Ratio;
+
+      auto PrintSubset = [&](raw_ostream &OS) {
+        OS << "[CudaKernelNoalias] kernel=" << F.getName()
+           << " subset_mask=0x" << Twine::utohexstr(Mask)
+           << " ratio=" << Ratio << " score=" << Score
+           << " sat=" << Sat << "/" << KP.launches.size() << " paths={";
+        for (size_t i = 0; i < SubPaths.size(); ++i) {
+          if (i) OS << ", "; OS << SubPaths[i];
+        }
+        OS << "}\n";
+      };
+      if (CudaNoaliasDebug) { PrintSubset(dbgs()); } else { LLVM_DEBUG(PrintSubset(dbgs())); }
+
+      if (Score > BestScore || (Score == BestScore && BestMask != 0 &&
+                                __builtin_popcount(BestMask) < __builtin_popcount(Mask))) {
+        BestScore = Score; BestMask = Mask; BestIdxPaths = std::move(SubIdx);
+        // Compute per-item single ratio for reporting
+        BestSingleRatio.clear(); BestSingleRatio.reserve(SubPaths.size());
+        for (const auto &P : SubPaths) {
+          size_t Cnt = 0; for (const auto &L : KP.launches) {
+            auto It = L.find(P); if (It != L.end() && It->second == 0) ++Cnt;
+          }
+          BestSingleRatio.push_back(KP.launches.empty() ? 0.0 : (double)Cnt / (double)KP.launches.size());
+        }
+      }
+    }
+
+    if (BestMask == 0 || BestIdxPaths.empty()) continue;
+
+    // Emit selection result
+    std::vector<SelectedNoaliasItem> Items;
+    for (size_t i = 0; i < BestIdxPaths.size(); ++i) {
+      SelectedNoaliasItem It; It.Indices = BestIdxPaths[i]; It.Ratio = BestSingleRatio[i];
+      Items.push_back(std::move(It));
+    }
+
+    auto PrintBest = [&](raw_ostream &OS) {
+      OS << "[CudaKernelNoalias] kernel=" << F.getName()
+         << " best_mask=0x" << Twine::utohexstr(BestMask)
+         << " best_score=" << BestScore << " selected={";
+      for (size_t i = 0; i < Items.size(); ++i) {
+        if (i) OS << ", ";
+        OS << "path=" << buildPath(Items[i].Indices) << "(ratio=" << Items[i].Ratio << ")";
+      }
+      OS << "}\n";
+    };
+    if (CudaNoaliasDebug) { PrintBest(dbgs()); } else { LLVM_DEBUG(PrintBest(dbgs())); }
+
+    SelectedByKernel[F.getName().str()] = std::move(Items);
+  }
+}
+
+// Dump selections to JSON file (array form), or merge into profile if no out given
+static void dumpSelectionsToJson(const std::map<std::string, std::vector<SelectedNoaliasItem>> &Selected,
+                                 const std::string &OutPath) {
+  if (OutPath.empty() || Selected.empty()) return;
+
+  FileLockGuard Lock(OutPath);
+  if (!Lock.acquired()) { errs() << "Warning: cannot acquire lock for '" << OutPath << "', skipping write.\n"; return; }
+
+  // Load existing selections to merge
+  std::map<std::string, std::vector<SelectedNoaliasItem>> Existing;
+  if (auto BufOrErr = MemoryBuffer::getFile(OutPath)) {
+    if (auto Parsed = json::parse(BufOrErr.get()->getBuffer())) {
+      if (auto *RootObj = Parsed->getAsObject()) {
+        if (auto *SelObj = RootObj->getObject("cuda_noalias_selected")) {
+          for (auto &KV : *SelObj) {
+            std::string KName = KV.first.str();
+            if (auto *Arr = KV.second.getAsArray()) {
+              for (const auto &V : *Arr) if (auto *O = V.getAsObject()) {
+                SelectedNoaliasItem It; if (auto *Idxs = O->getArray("indices")) {
+                  for (const auto &X : *Idxs) if (auto I = X.getAsInteger()) It.Indices.push_back((unsigned)*I);
+                }
+                if (auto R = O->getNumber("ratio")) It.Ratio = *R; if (!It.Indices.empty()) Existing[KName].push_back(std::move(It));
+              }
+            }
+          }
+        } else if (auto *SelArr = RootObj->getArray("cuda_noalias_selected")) {
+          for (const auto &Elem : *SelArr) if (auto *Obj = Elem.getAsObject()) {
+            std::string KName; if (auto KS = Obj->getString("name")) KName = KS->str(); else if (auto KS2 = Obj->getString("kernel")) KName = KS2->str();
+            if (KName.empty()) continue; if (auto *Arr = Obj->getArray("selected")) {
+              for (const auto &V : *Arr) if (auto *O = V.getAsObject()) {
+                SelectedNoaliasItem It; if (auto *Idxs = O->getArray("indices")) {
+                  for (const auto &X : *Idxs) if (auto I = X.getAsInteger()) It.Indices.push_back((unsigned)*I);
+                }
+                if (auto R = O->getNumber("ratio")) It.Ratio = *R; if (!It.Indices.empty()) Existing[KName].push_back(std::move(It));
+              }
+            }
+          }
+        }
+      }
     }
   }
-  
-  // Copy the existing nvvm.annotations entry so the clone is still a kernel
-  Module *M = OrigF.getParent();
-  NamedMDNode *NMD = M->getOrInsertNamedMetadata("nvvm.annotations");
-  
+
+  auto indicesEqual = [](const SmallVector<unsigned,4> &A, const SmallVector<unsigned,4> &B) -> bool {
+    if (A.size() != B.size()) return false;
+    for (size_t i = 0; i < A.size(); ++i) if (A[i] != B[i]) return false;
+    return true;
+  };
+
+  // Merge
+  for (const auto &KV : Selected) {
+    auto &Dst = Existing[KV.first];
+    for (const auto &It : KV.second) {
+      bool Replaced = false; for (auto &Old : Dst) { if (indicesEqual(Old.Indices, It.Indices)) { Old.Ratio = It.Ratio; Replaced = true; break; } }
+      if (!Replaced) Dst.push_back(It);
+    }
+  }
+
+  // Serialize array form
+  json::Array Kernels;
+  for (const auto &KV : Existing) {
+    json::Object KObj; KObj["name"] = KV.first; json::Array Items;
+    for (const auto &It : KV.second) { json::Object O; json::Array Idxs; for (unsigned idx : It.Indices) Idxs.push_back((int64_t)idx);
+      O["indices"] = std::move(Idxs); O["value"] = ""; O["ratio"] = It.Ratio; Items.push_back(std::move(O)); }
+    KObj["selected"] = std::move(Items); Kernels.push_back(std::move(KObj));
+  }
+  json::Object Root; Root["cuda_noalias_selected"] = std::move(Kernels);
+  std::error_code EC; raw_fd_ostream OS(OutPath, EC); if (EC) { errs() << "Failed to write cuda-kernel-noalias-selected-out to '" << OutPath << "': " << EC.message() << "\n"; return; }
+  OS << formatv("{0:2}\n", json::Value(std::move(Root)));
+}
+
+static void mergeSelectionsIntoProfile(const std::map<std::string, std::vector<SelectedNoaliasItem>> &Selected,
+                                       const std::string &ProfilePath) {
+  if (ProfilePath.empty() || Selected.empty()) return;
+
+  FileLockGuard Lock(ProfilePath);
+  if (!Lock.acquired()) { errs() << "Warning: cannot acquire lock for '" << ProfilePath << "', skipping write.\n"; return; }
+
+  // Load existing
+  std::map<std::string, std::vector<SelectedNoaliasItem>> Existing;
+  json::Object Root;
+  if (auto BufOrErr = MemoryBuffer::getFile(ProfilePath)) {
+    if (auto Parsed = json::parse(BufOrErr.get()->getBuffer())) {
+      if (auto *Obj = Parsed->getAsObject()) {
+        Root = *Obj;
+        if (auto *SelObj = Root.getObject("cuda_noalias_selected")) {
+          for (auto &KV : *SelObj) {
+            std::string KName = KV.first.str();
+            if (auto *Arr = KV.second.getAsArray()) {
+              for (const auto &V : *Arr) if (auto *O = V.getAsObject()) {
+                SelectedNoaliasItem It; if (auto *Idxs = O->getArray("indices")) {
+                  for (const auto &X : *Idxs) if (auto I = X.getAsInteger()) It.Indices.push_back((unsigned)*I);
+                }
+                if (auto R = O->getNumber("ratio")) It.Ratio = *R; if (!It.Indices.empty()) Existing[KName].push_back(std::move(It));
+              }
+            }
+          }
+        } else if (auto *SelArr = Root.getArray("cuda_noalias_selected")) {
+          for (const auto &Elem : *SelArr) if (auto *Obj2 = Elem.getAsObject()) {
+            std::string KName; if (auto KS = Obj2->getString("name")) KName = KS->str(); else if (auto KS2 = Obj2->getString("kernel")) KName = KS2->str();
+            if (KName.empty()) continue; if (auto *Arr = Obj2->getArray("selected")) {
+              for (const auto &V : *Arr) if (auto *O = V.getAsObject()) {
+                SelectedNoaliasItem It; if (auto *Idxs = O->getArray("indices")) {
+                  for (const auto &X : *Idxs) if (auto I = X.getAsInteger()) It.Indices.push_back((unsigned)*I);
+                }
+                if (auto R = O->getNumber("ratio")) It.Ratio = *R; if (!It.Indices.empty()) Existing[KName].push_back(std::move(It));
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  auto indicesEqual = [](const SmallVector<unsigned,4> &A, const SmallVector<unsigned,4> &B) -> bool {
+    if (A.size() != B.size()) return false; for (size_t i = 0; i < A.size(); ++i) if (A[i] != B[i]) return false; return true;
+  };
+
+  // Merge incoming
+  for (const auto &KV : Selected) {
+    auto &Dst = Existing[KV.first];
+    for (const auto &It : KV.second) {
+      bool Replaced = false; for (auto &Old : Dst) { if (indicesEqual(Old.Indices, It.Indices)) { Old.Ratio = It.Ratio; Replaced = true; break; } }
+      if (!Replaced) Dst.push_back(It);
+    }
+  }
+
+  // Serialize back as array form
+  json::Array Kernels;
+  for (const auto &KV : Existing) {
+    json::Object KObj; KObj["name"] = KV.first; json::Array Items;
+    for (const auto &It : KV.second) {
+      json::Object O; json::Array Idxs; for (unsigned idx : It.Indices) Idxs.push_back((int64_t)idx);
+      O["indices"] = std::move(Idxs); O["value"] = ""; O["ratio"] = It.Ratio; Items.push_back(std::move(O));
+    }
+    KObj["selected"] = std::move(Items); Kernels.push_back(std::move(KObj));
+  }
+  Root["cuda_noalias_selected"] = std::move(Kernels);
+  std::error_code EC; raw_fd_ostream OS(ProfilePath, EC);
+  if (EC) { errs() << "Failed to update profile '" << ProfilePath << "' with noalias selections: " << EC.message() << "\n"; return; }
+  OS << formatv("{0:2}\n", json::Value(std::move(Root)));
+}
+
+// Clone kernel with noalias attributes on selected TOP-LEVEL parameters
+static Function *cloneKernelWithNoalias(Function &OrigF,
+                                        const std::vector<SelectedNoaliasItem> &Items) {
+  ValueToValueMapTy VMap; Function *ClonedF = CloneFunction(&OrigF, VMap);
+  std::string NewName = OrigF.getName().str() + "_noalias"; ClonedF->setName(NewName);
+
+  // Collect unique top-level arg indices
+  SmallSet<unsigned, 8> Top;
+  for (const auto &It : Items) if (!It.Indices.empty()) Top.insert(It.Indices.front());
+  for (unsigned Idx : Top) if (Idx < ClonedF->arg_size()) ClonedF->addParamAttr(Idx, Attribute::NoAlias);
+
+  // Copy nvvm.annotations kernel tag
+  Module *M = OrigF.getParent(); NamedMDNode *NMD = M->getOrInsertNamedMetadata("nvvm.annotations");
   for (unsigned i = 0, e = NMD->getNumOperands(); i != e; ++i) {
     const MDNode *MD = NMD->getOperand(i);
     if (MD->getNumOperands() >= 3) {
@@ -188,21 +573,14 @@ static Function *cloneKernelWithNoalias(Function &OrigF,
           if (auto *Str = dyn_cast<MDString>(MD->getOperand(1))) {
             if (Str->getString() == "kernel") {
               LLVMContext &Ctx = M->getContext();
-              Metadata *MDVals[] = {
-                ValueAsMetadata::get(ClonedF),
-                MDString::get(Ctx, "kernel"),
-                MD->getOperand(2)
-              };
-              MDNode *NewMD = MDNode::get(Ctx, MDVals);
-              NMD->addOperand(NewMD);
-              break;
+              Metadata *MDVals[] = { ValueAsMetadata::get(ClonedF), MDString::get(Ctx, "kernel"), MD->getOperand(2) };
+              MDNode *NewMD = MDNode::get(Ctx, MDVals); NMD->addOperand(NewMD); break;
             }
           }
         }
       }
     }
   }
-  
   return ClonedF;
 }
 
@@ -212,32 +590,30 @@ PreservedAnalyses CudaKernelNoaliasPass::run(Module &M, ModuleAnalysisManager &A
     return PreservedAnalyses::all();
   }
 
-  bool Changed = false;
-  std::vector<Function *> KernelsToProcess;
-  
-  // Collect all kernel functions in the module
-  for (Function &F : M) {
-    if (isKernelFunction(F)) {
-      KernelsToProcess.push_back(&F);
-    }
+  // Compute selections
+  computeBestSelections(M, AM);
+
+  bool Changed = false; std::vector<Function*> Kernels;
+  for (Function &F : M) if (isKernelFunction(F)) Kernels.push_back(&F);
+
+  for (Function *F : Kernels) {
+    auto It = SelectedByKernel.find(F->getName().str());
+    if (It == SelectedByKernel.end() || It->second.empty()) continue;
+
+    Function *Clone = cloneKernelWithNoalias(*F, It->second);
+    (void)Clone; Changed = true;
+    LLVM_DEBUG(dbgs() << "Cloned kernel " << F->getName() << " to " << Clone->getName()
+                      << " with noalias on " << It->second.size() << " selected entries\n");
   }
-  
-  // Process each kernel function
-  for (Function *F : KernelsToProcess) {
-    std::vector<unsigned> NoAliasParams = getNoAliasPointerIndices(*F);
-    
-    // Clone the kernel only when there is at least one parameter to mark
-    if (!NoAliasParams.empty()) {
-      std::string Suffix = "noalias";
-      Function *ClonedF = cloneKernelWithNoalias(*F, NoAliasParams, Suffix);
-      Changed = true;
-      
-      LLVM_DEBUG(dbgs() << "Cloned kernel " << F->getName() 
-                       << " to " << ClonedF->getName() 
-                       << " with noalias on " << NoAliasParams.size() 
-                       << " pointer parameters\n");
-    }
+
+  if (!CudaNoaliasSelectedOut.empty()) {
+    dumpSelectionsToJson(SelectedByKernel, CudaNoaliasSelectedOut);
+  } else {
+    std::string EffectivePath;
+    if (!CudaProfilePath.empty()) EffectivePath = CudaProfilePath;
+    else if (const char *Env = std::getenv("CUDA_KERNEL_PROFILE")) EffectivePath = Env;
+    if (!EffectivePath.empty()) mergeSelectionsIntoProfile(SelectedByKernel, EffectivePath);
   }
-  
+
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
-} 
+}

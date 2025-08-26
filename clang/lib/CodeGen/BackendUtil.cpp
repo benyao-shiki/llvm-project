@@ -1113,16 +1113,18 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
 
     // Handle CUDA kernel noalias optimization.
     if (CodeGenOpts.CudaKernelNoalias) {
-      PB.registerPipelineEarlySimplificationEPCallback(
-          [&](ModulePassManager &MPM, OptimizationLevel Level, ThinOrFullLTOPhase Phase) {
+      PB.registerOptimizerEarlyEPCallback(
+          [&](ModulePassManager &MPM, OptimizationLevel Level,
+              ThinOrFullLTOPhase Phase) {
             MPM.addPass(CudaKernelNoaliasPass());
           });
     }
 
     // Handle CUDA kernel constant propagation optimization.
     if (CodeGenOpts.CudaKernelConst) {
-      PB.registerPipelineEarlySimplificationEPCallback(
-          [&](ModulePassManager &MPM, OptimizationLevel Level, ThinOrFullLTOPhase Phase) {
+      PB.registerOptimizerEarlyEPCallback(
+          [&](ModulePassManager &MPM, OptimizationLevel Level,
+              ThinOrFullLTOPhase Phase) {
             MPM.addPass(CudaKernelConstPass());
           });
     }

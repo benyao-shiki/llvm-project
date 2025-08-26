@@ -1,208 +1,141 @@
-# CUDA Kernel **Noalias** Optimization
+# CUDA Kernel Noalias 优化
 
-This document explains the design, build-time switches and run-time requirements for the *Kernel Noalias* optimisation implemented in the LLVM/Clang CUDA tool-chain contained in this repository.
-
----
-
-## 1. Motivation
-
-Many CUDA kernels receive several pointer parameters that are guaranteed **not** to alias each other.  If the compiler is aware of this property it can perform more aggressive memory-optimisations (LICM, vectorisation, memory coalescing, …).  Unfortunately the information is seldom available at compile time.
-
-The *Kernel Noalias* pipeline bridges that gap:
-
-1.  **profilers** a tool based on nvbit, which identify kernels and pointer arguments that never alias in practice and emit a JSON profile.
-2.  **LLVM pass** (`CudaKernelNoaliasPass`) clones each hot kernel, annotates the selected parameters with the `noalias` attribute and keeps the original version untouched.
-3.  **Clang front-end** (`CGCUDARuntime`) inserts a small run-time check in every launch site that dynamically chooses between the specialised *noalias* stub and the normal stub.
-4.  A hook func (`check_ptr_sets`) provides the alias ptr check at run time.
-
-The result is a *fully automatic*, profile-guided optimisation that yields large speed-ups while being 100 % safe – when aliasing is detected we simply fall back to the unoptimised kernel.
+本文档描述本仓库中 LLVM/Clang CUDA 工具链的“Kernel Noalias”优化的设计、输入输出格式、启用方式以及前端的动态选择逻辑。内容已与当前实现保持一致，并与 const 优化在风格与命名匹配策略上对齐。
 
 ---
 
-## 2. JSON profile format
+## 1. 背景动机
 
-The optimiser consumes a single JSON file (e.g. `profile_test.json`).  A reduced example:
+很多 CUDA kernel 接收多个指针实参，这些指针在实际运行中往往互不别名。如果编译器知道这一点，可以更激进地做内存优化（如 LICM、向量化、访存合并等）。Noalias 优化通过“离线 profile + 编译期/前端协作”的方式，在不改变语义的前提下自动选择添加 `noalias` 属性的 kernel 变体，以获得性能收益：
+
+- Profile 收集每次 launch 的指针（含结构体成员路径）的别名标记；
+- LLVM pass 基于所有 launches 的统计，结合 `CudaKernelAnalysis` 的指针权重，选择“高收益、且高比例不发生别名”的指针子集，为此克隆 kernel 并在克隆上标注 `noalias`；
+- Clang 前端在每个 launch 站点插入一次轻量运行时检查，动态选择“优化 stub”还是“原始 stub”，语义安全。
+
+---
+
+## 2. JSON Profile 输入与结果输出
+
+当前实现不再依赖历史的 `hot_kernels` 摘要，而是只使用逐次 launch 的明细记录 `kernels[]`。每个 kernel 记录包含其一次 launch 的参数展开，其中指针（含结构体成员）带有 `alias` 标识：
+
+- `alias = 0` 表示该 launch 中该指针未与其他指针发生别名（可作为 noalias 候选的积极证据）。
+- 未出现或非零表示未知/可能别名。
+
+当参数为结构体或数组时，成员被递归展开。关键在于，每个成员现在通过其**字节偏移量** (`offset`) 而非逻辑索引 (`index`) 来唯一标识。
+
+示例（简化）：
 
 ```json
-      "name": "_Z11gemm_kerneliiiffPfS_S_",
-      "demangled_name": "gemm_kernel(int, int, int, float, float, float*, float*, float*)",
-      "launches": 1,
-      "common_scalars": [
-        {
-          "arg": 0,
-          "value": "512",
-          "ratio": 1
-        }
-      ],
-      "common_dims": [
-        {
-          "dim": "gridDim.x",
-          "value": 16,
-          "ratio": 1
-        }
-      ],
-      "noalias_pointers": [
-        {
-          "arg": 5,
-          "ratio": 1
-        },
-        {
-          "arg": 6,
-          "ratio": 1
-        },
-        {
-          "arg": 7,
-          "ratio": 1
-        }
+{
+  "kernels": [
+    {
+      "name": "__device_stub__gemm_kernel...",
+      "params": [
+        { "index": 0, "offset": 0, "type": "int",   "value": 512 },
+        { "index": 1, "offset": 8, "type": "float*", "alias": 0 },
+        { "index": 2, "offset": 16, "type": "float*", "alias": 0 },
+        { "index": 3, "offset": 24, "type": "float*", "alias": 1 }
       ]
-```
-
-Keys:
-
-*   `hot_kernels[]` – kernels that should be specialised.
-*   `name` – *device* side mangled name (same as shown in PTX / `nvcc --ptxas-options=-v`).
-*   `noalias_pointers[]` – list of pointer arguments (zero-based) that are known never to alias **any** other pointer argument of the same launch.
-
-If either the kernel is absent from the array or its list is empty, that kernel is left untouched.
-
----
-
-## 3. LLVM Pass – `CudaKernelNoaliasPass`
-
-Location: `llvm/lib/Transforms/CudaKernelNoalias/`.
-
-Activation:
-
-```bash
-clang++ -mllvm -cuda-kernel-profile=/path/to/profile_test.json …
-```
-
-Behaviour:
-
-1.  Scans every function with calling convention `ptx_kernel` (or with `nvvm.annotations` == "kernel").
-2.  Looks up the function name in the parsed profile map.
-3.  If at least one pointer index is listed:
-    *   Clones the function with name `<orig>_noalias`.
-    *   Adds attribute `noalias` to the specified parameters in the clone **only**.
-    *   Copies the original `nvvm.annotations` entry so that the clone is also visible to the GPU driver.
-
-
----
-
-## 4. Clang Front-End Support (`CGCUDARuntime.cpp`)
-
-Compile-time switch:
-
-```
-–fcuda-kernel-noalias   # sets CodeGenOpts.CudaKernelNoalias
-```
-
-(the flag name is indicative – use the one wired in your local driver).
-
-### 4.1  Profile loading
-
-`loadCudaKernelProfile()` is executed on first use and re-uses **the same JSON file** as the LLVM pass.  The path is resolved in the following order:
-
-1.  Environment variable `CUDA_KERNEL_PROFILE`.
-2.  Last occurrence of the backend option `-cuda-kernel-profile=<file>`.
-
-### 4.2  Launch-site transformation
-
-At every host-side kernel call Clang now emits:
-
-```
-if (!TargetPtrs.empty() &&
-    !check_ptr_sets(TargetPtrs.size(), TargetPtrs, OtherPtrs.size(), OtherPtrs))
-  __device_stub__foo_noalias<<<…>>>();   // no alias – fast path
-else
-  __device_stub__foo<<<…>>>();           // aliasing possible – safe path
-```
-
-Where
-
-*   **TargetPtrs** – the pointer arguments whose indices were listed in the profile.
-*   **OtherPtrs**  – all other pointer arguments.
-*   The helper returns *true* when aliasing happen.
-
-The name lookup is tolerant: if the full mangled name is not present in the profile the front-end strips the `__device_stub__` prefix and performs a suffix match so that device-side and host-side names map correctly.
-
-### 4.3  External symbol
-
-`check_ptr_sets` is declared but **not** defined in Clang-generated IR.  It is defined at a lib based on nvbit.
-
----
-
-## 5. Hook func – `check_ptr_sets`
-
-
-Signature:
-
-```c
-bool check_ptr_sets(int n_targets, void **targets,
-                    int n_others,  void **others);
-```
-
-It returns *true* if *any* pointer in *targets* may alias other ptr in the two sets.
-
-
----
-
-## 6. Full build & run recipe
-
-```bash
-# 1. collect / generate JSON profile
-LD_PRELOAD=libkernel_profile.so ./gemm
-
-# 2. compile with pass + frontend support
-clang++ -fcuda-kernel-noalias \
-       -mllvm -cuda-kernel-profile=profile_test.json \
-       -L/path/to/libcheckkernel.so -lcheckkernel \
-       -c gemm.cu -o gemm_opt
-
-# 3. run
-export LD_PRELOAD=/path/to/libcheckkernel.so
-./gemm_opt
-```
----
-
-## 7. Bug修复记录
-
-### 7.1 CGCUDARuntime.cpp中的Stub查找修复
-
-**问题**: 在生成noalias优化的stub函数时，查找逻辑存在问题导致无法正确找到noalias版本的stub函数。
-
-**修复位置**: `clang/lib/CodeGen/CGCUDARuntime.cpp:458`
-
-**修复内容**:
-```cpp
-// 修复前：查找逻辑不正确，导致无法找到noalias版本的stub
-// 修复后：正确查找noalias版本的stub函数
-if (auto *NoaliasStub = CGM.getModule().getFunction(F->getName().str() + "_noalias_stub")) {
-  // 使用noalias版本的stub
+    }
+  ]
 }
 ```
 
-**影响**: 确保运行时能够正确识别和调用noalias优化版本的kernel，使得整个优化链路能够正常工作。
+Pass 选择完成后，会将选择结果写入：
 
-### 7.2 Stub与Device Kernel映射修复
+- 以“单文件合并”的方式补写回 profile：键 `cuda_noalias_selected`；或
+- 若传入 `-mllvm -cuda-kernel-noalias-selected-out=<file>`，则以数组形式输出到该文件。
 
-**问题**: 生成的stub函数与对应的device kernel映射关系不正确，导致运行时无法正确选择优化版本。
+输出形如：
 
-**修复内容**: 
-- 修复了stub函数命名规则，确保与device kernel名称一致
-- 修复了运行时查找逻辑，确保能正确匹配优化版本
-- 完善了错误处理机制，在找不到优化版本时正确回退到原始版本
+```json
+{
+  "cuda_noalias_selected": [
+    {
+      "name": "_Z11gemm_kerneliiiffPfS_S_",
+      "selected": [
+        { "indices": [0, 8], "value": "", "ratio": 1.0 },
+        { "indices": [0, 16], "value": "", "ratio": 0.9 }
+      ]
+    }
+  ]
+}
+```
 
-**测试验证**: 通过实际测试验证了修复后的系统能够：
-- ✅ 正确生成noalias优化的stub函数
-- ✅ 正确生成对应的device kernel
-- ✅ 运行时能正确选择kernel版本
-- ✅ 在检测到别名时正确回退到原始版本
+其中：
+- `indices` 为 `[ArgIndex, ByteOffset]` 路径。
+- `value` 字段为与 const 统一的占位，noalias 不使用。
+- `ratio` 为该条目的单独“无别名比例”，用于日志与调试。
 
 ---
 
-## 8. Limitations & future work
+## 3. LLVM Pass（CudaKernelNoaliasPass）工作机制
 
-* Currently we only distinguish *alias* vs *no-alias* at the granularity of the whole kernel launch; finer grained specialisations (e.g. per-subset) are possible extensions.
-* Consider more host-device optimization chances, like Constant Propagation from host to device, as sometimes the kernel is launched with a fixed config(args, grid and block dimensions...)
+位置：`llvm/lib/Transforms/CudaKernelNoalias/`
+
+启用：
+
+```bash
+clang++ ... -mllvm -cuda-kernel-profile=/path/to/profile.json
+# 可选：-mllvm -cuda-kernel-noalias-debug -mllvm -cuda-kernel-noalias-selected-out=/tmp/noalias.json
+```
+
+流程：
+- 解析 `kernels[]`，通过递归地累加 `offset` 字段，将每次 launch 扁平化为“`argIndex.byteOffset` -> alias 标记”的映射；
+- 从 `CudaKernelAnalysis` 读取指针权重表，其中每个成员都由其字节偏移量唯一标识；
+- 枚举候选指针集合的所有非空子集，基于字节偏移量路径进行匹配和计分；
+- 克隆 kernel 得到 `<orig>_noalias`，仅对“顶层参数索引集合”添加 `noalias` 属性（结构体成员会归并到其顶层形参）；
+- 复制 `nvvm.annotations` 的 `kernel` 标注，使克隆在设备侧可见；
+- 以 `!cuda.noalias.selected` 元数据记录结果（路径为 `[arg, offset]`），并按需写回 JSON。
+
+名称匹配：当前已不再需要复杂的名称规范化逻辑。Pass 直接使用 `device_side_name` (若存在) 或原始 `name` 与 IR 中的函数名进行匹配。
+
 ---
+
+## 4. 前端动态选择逻辑（CGCUDARuntime.cpp）
+
+位置：`clang/lib/CodeGen/CGCUDARuntime.cpp`
+
+启用：
+
+```bash
+clang++ ... -fcuda-kernel-noalias -mllvm -cuda-kernel-profile=/path/to/profile.json
+```
+
+运行时在每个 kernel launch 站点插入：
+- 从 `cuda_noalias_selected` 读到的 `[arg, offset]` 列表构造“目标指针集”。
+- **获取成员地址**：前端通过 `ASTContext::getASTRecordLayout` 获取结构体的内存布局，然后遍历其字段以找到与元数据中 `offset` 匹配的 `FieldDecl`，从而准确获取成员指针的地址。
+- “其他指针集”则为本次调用所有指针实参（顶层）减去目标顶层索引；
+- 调用钩子 `check_ptr_sets(int n_targets, void** targets, int n_others, void** others)`：若返回“无别名”，则调用 `__device_stub__foo_noalias<<<...>>>`，否则调用原始 `__device_stub__foo<<<...>>>`。
+
+外部符号：
+- `check_ptr_sets` 仅声明不定义，需要在链接/运行时由外部库提供（如基于 nvbit 的实现）。
+
+---
+
+## 5. 构建与运行
+
+(流程不变)
+
+---
+
+## 6. 调试与日志
+
+- `-mllvm -cuda-kernel-noalias-debug`：打印候选集合、子集比例/得分、最终选择以及被跳过原因（无 profile/launches/candidates）。
+- `-mllvm -cuda-kernel-noalias-selected-out=/tmp/noalias.json`：将选择结果按数组形式单独输出，便于前端/人工检查。
+
+---
+
+## 7. 与 const 优化的一致性
+
+- **路径表示**：两个优化现在都统一使用 `[ArgIndex, ByteOffset]` 作为参数成员的唯一标识，解决了逻辑索引与物理布局不匹配的问题。
+- **Profile 解析**：都采用相同的递归累加 `offset` 的逻辑来处理 profile JSON。
+- **前端代码生成**：都使用 `ASTRecordLayout` 来从字节偏移量反向查找 `FieldDecl`，以在运行时获取正确的参数地址/值。
+
+---
+
+## 8. 已知限制与后续工作
+
+- 目前 noalias 的运行时判定在每次 launch 以“集合级别”区分，无更细粒度（未来可扩展为多子集/多变体）。
+- 仅对克隆的顶层参数添加 `noalias`，结构体成员的 noalias 语义通过“选择与聚合”体现；如需更细致的 IR 级别刻画可考虑后续扩展。
+- 钩子 `check_ptr_sets` 的实现与系统/驱动强相关，需保证与编译期预期一致。 

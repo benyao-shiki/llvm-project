@@ -581,28 +581,10 @@ void CGNVCUDARuntime::emitNoaliasDeviceStub(CodeGenFunction &CGF,
   // Copy attributes from original function
   NoaliasStub->copyAttributesFrom(CGF.CurFn);
   
-  // Set up kernel handle for noalias stub - it should call the noalias device kernel
-  // Extract the device kernel name by removing the __device_stub__ prefix
-  std::string StubName = CGF.CurFn->getName().str();
-  std::string DeviceKernelName = StubName;
-  
-  // Remove __device_stub__ prefix if present
-  const std::string StubPrefix = "__device_stub__";
-  if (DeviceKernelName.find(StubPrefix) == 0) {
-    DeviceKernelName = DeviceKernelName.substr(StubPrefix.length());
-  }
-  
-  // Construct the noalias device kernel name
-  std::string NoaliasDeviceKernelName = DeviceKernelName + "_noalias";
-  
-  // Look for the noalias device kernel in the module
-  if (llvm::Function *NoaliasDeviceKernel = CGM.getModule().getFunction(NoaliasDeviceKernelName)) {
-    KernelHandles[NoaliasStub->getName()] = NoaliasDeviceKernel;
-  } else {
-    // Fallback to original kernel if noalias version not found
-    KernelHandles[NoaliasStub->getName()] = KernelHandles[CGF.CurFn->getName()];
-  }
-  
+  // Host handle register
+  // need to explicitly set the host handle to the noalias stub, cause the noalias stub is copied from the original kernel, so it will not call getKernelHandle()
+  KernelHandles[NoaliasStub->getName()] = NoaliasStub;
+   
   // Generate the function body for noalias stub
   {
     CodeGenFunction NoaliasCGF(CGM);
@@ -641,36 +623,25 @@ void CGNVCUDARuntime::emitNoaliasDeviceStub(CodeGenFunction &CGF,
 
 void CGNVCUDARuntime::emitConstDeviceStub(CodeGenFunction &CGF,
                                           FunctionArgList &Args) {
-  // Create a new function for the const stub
-  std::string ConstStubName = CGF.CurFn->getName().str() + "_const";
-  llvm::FunctionType *FT = CGF.CurFn->getFunctionType();
-  llvm::Function *ConstStub = llvm::Function::Create(
-      FT, CGF.CurFn->getLinkage(), ConstStubName, CGM.getModule());
+  std::string BaseStubName = CGM.getMangledName(GlobalDecl(dyn_cast<FunctionDecl>(CGF.CurFuncDecl), KernelReferenceKind::Stub)).str();
+  std::string ConstStubName = BaseStubName + "_const";
+
+  llvm::Function *ConstStub = CGM.getModule().getFunction(ConstStubName);
+  if (!ConstStub) {
+    llvm::FunctionType *FT = CGF.CurFn->getFunctionType();
+    ConstStub = llvm::Function::Create(FT, CGF.CurFn->getLinkage(),
+                                       ConstStubName, CGM.getModule());
+  }
+
+  // Ensure the function is not just a declaration.
+  ConstStub->setLinkage(CGF.CurFn->getLinkage());
   
   // Copy attributes from original function
   ConstStub->copyAttributesFrom(CGF.CurFn);
   
-  // Set up kernel handle for const stub - it should call the const device kernel
-  // Extract the device kernel name by removing the __device_stub__ prefix
-  std::string StubName = CGF.CurFn->getName().str();
-  std::string DeviceKernelName = StubName;
-  
-  // Remove __device_stub__ prefix if present
-  const std::string StubPrefix = "__device_stub__";
-  if (DeviceKernelName.find(StubPrefix) == 0) {
-    DeviceKernelName = DeviceKernelName.substr(StubPrefix.length());
-  }
-  
-  // Construct the const device kernel name
-  std::string ConstDeviceKernelName = DeviceKernelName + "_const";
-  
-  // Look for the const device kernel in the module
-  if (llvm::Function *ConstDeviceKernel = CGM.getModule().getFunction(ConstDeviceKernelName)) {
-    KernelHandles[ConstStub->getName()] = ConstDeviceKernel;
-  } else {
-    // Fallback to original kernel if const version not found
-    KernelHandles[ConstStub->getName()] = KernelHandles[CGF.CurFn->getName()];
-  }
+  // Host handle register
+  // need to explicitly set the host handle to the const stub, cause the const stub is copied from the original kernel, so it will not call getKernelHandle()
+  KernelHandles[ConstStub->getName()] = ConstStub;
   
   // Generate the function body for const stub
   {

@@ -15,24 +15,29 @@
 #define LLVM_TRANSFORMS_CUDAKERNELNOALIAS_CUDAKERNELNOALIAS_H
 
 #include "llvm/IR/PassManager.h"
+#include "llvm/ADT/StringMap.h"
 #include <string>
 #include <map>
 #include <vector>
 
 namespace llvm {
 
-// Information for a pointer argument parsed from the profile log
-struct PointerInfo {
-  unsigned index; // Argument index (0-based)
-};
-
-// Per-kernel profile information parsed from the JSON log
-struct KernelProfile {
-  std::string name;
-  std::vector<PointerInfo> pointerParams;
-};
-
 class Module;
+
+// Per-kernel profile info for noalias constructed from launches[]
+struct KernelNoaliasProfile {
+  std::string name;
+  std::map<unsigned, std::string> argIndexToName; // readable names (optional)
+  std::vector<StringMap<int>> launches;           // flattened path -> alias flag (0 means no-alias)
+  // Map from host stub names to device side names for accurate kernel matching
+  std::map<std::string, std::string> deviceSideNames;
+};
+
+// Selected item to mark as noalias (full indices path)
+struct SelectedNoaliasItem {
+  SmallVector<unsigned, 4> Indices; // [arg, member, ...]
+  double Ratio = 0.0;               // single ratio for reporting
+};
 
 /// Pass that clones CUDA kernel functions to create noalias versions
 class CudaKernelNoaliasPass : public PassInfoMixin<CudaKernelNoaliasPass> {
@@ -42,10 +47,11 @@ public:
 
 private:
   std::string ProfilePath;
-  std::map<std::string, KernelProfile> KernelProfiles;
-  
+  std::map<std::string, KernelNoaliasProfile> KernelProfiles;
+  std::map<std::string, std::vector<SelectedNoaliasItem>> SelectedByKernel;
+
   bool parseProfileLog();
-  std::vector<unsigned> getNoAliasPointerIndices(const Function &F);
+  void computeBestSelections(Module &M, ModuleAnalysisManager &AM);
 };
 
 } // namespace llvm

@@ -29,6 +29,8 @@
 # Nested build directory
 /build*
 /CudaArgsProfileRuntime/build*
+/CudaArgsCheck/build*
+/cutlass_test/
 #==============================================================================#
 # Explicit files to ignore (only matches one).
 #==============================================================================#

@@ -2,291 +2,111 @@
 
 ## Overview
 
-CudaKernelAnalysis is an LLVM analysis pass specifically designed to analyze CUDA kernel function parameters and their impact on kernel IR, providing decision-making basis for subsequent optimization passes.
+CudaKernelAnalysis 是一个针对 CUDA kernel 的 LLVM 分析 pass，用于分析内核参数（包含按值结构体成员）的使用形态与重要性，为后续优化（如常量传播、noalias）提供权重依据与成员路径信息。
+
+该 pass 的核心是将参数成员唯一地标识为其**顶层参数索引**和从该参数开始的**字节偏移量**。
 
 ## Features
 
 ### 1. CUDA Kernel Identification
-- Identifies CUDA kernel functions through `ptx.kernel` attribute
-- Identifies CUDA kernel functions through `PTX_Kernel` calling convention
-- Automatically skips analysis for non-CUDA kernel functions
+- 通过调用约定 `PTX_Kernel` 或函数属性 `"ptx.kernel"` 识别 CUDA kernel。
+- 自动跳过非 CUDA kernel 函数。
 
 ### 2. Unified Parameter Analysis
-Analyzes all parameter types (scalars, pointers, and struct members) using a unified approach:
-- **Scalar parameters**: Integers and floating-point numbers
-- **Pointer parameters**: Pointer types for noalias analysis
-- **Struct members**: Individual members of struct parameters passed by value
-- **Nested structs**: Supports nested struct members with index tracking
+统一分析三类：
+- 标量参数（整数/浮点）
+- 指针参数（用于 noalias）
+- 结构体成员（支持按值传递的结构体与嵌套成员）
 
-### 3. Weight-Based Analysis
-All parameters are analyzed using consistent weight calculation rules:
+成员路径以 `[ArgIndex, ByteOffset]` 的形式表示。例如：`[1, 4]` 表示第 1 个参数（从0计数）的偏移量为 4 字节的成员。
 
-#### Scalar Analysis (Control Flow Importance)
-- **Branch instruction usage**: Parameters directly used in `br` or `switch` instructions get weight +10
-- **Comparison instruction usage**: Parameters used in comparison instructions with results used in branches get weight +5
-- Higher weights indicate parameters are more important in control flow
+### 3. Weight Rules（权重规则）
+- 标量权重（控制流重要性）：
+  - 直接用于 `br`/`switch`：+10
+  - 用于比较且比较结果用于分支：+5
+  - 循环内使用：+3
+  - 作为 `store` 的被存储值：+4
+  - 参与二元（算术/位）运算：+2
+- 指针权重（noalias 潜力）：
+  - 循环内使用：+5
+  - load/store：+3
+  - GEP 指针运算：+2
+  - 循环不变（Loop-invariant）：+2
 
-#### Pointer Analysis (NoAlias Optimization Potential)
-- **Base usage**: +1 weight for being used in the function
-- **Loop usage**: +5 weight if used inside a loop
-- **Memory operations**: +3 weight for load/store operations
-- **Pointer arithmetic**: +2 weight for GEP operations
-- **Loop-invariant usage**: +2 weight if the pointer is loop-invariant
-- Higher weights indicate better candidates for `noalias` optimization
-
-## Usage
-
-### 1. Basic Usage
-
-```bash
-# Use in pass pipeline
-./bin/opt -passes='require<cuda-kernel-analysis>' -disable-output input.ll
-
-# Get debug output
-./bin/opt -passes='require<cuda-kernel-analysis>' -debug-only=cuda-kernel-analysis -disable-output input.ll
-```
-
-### 2. Using with Other Passes
-
-```bash
-# Use before transform passes
-./bin/opt -passes='require<cuda-kernel-analysis>,your-transform-pass' input.ll
-
-# Use with multiple passes
-./bin/opt -passes='require<cuda-kernel-analysis>,cuda-kernel-noalias,cuda-kernel-const' input.ll
-```
-
-### 3. Debug Options
-
-```bash
-# Enable all debug output
-./bin/opt -debug -passes='require<cuda-kernel-analysis>' input.ll
-
-# Enable only cuda-kernel-analysis debug output
-./bin/opt -debug-only=cuda-kernel-analysis -passes='require<cuda-kernel-analysis>' input.ll
-```
-
-## Output Examples
-
-### Debug Output Example
-
-```
-CudaKernelAnalysis: Analyzing CUDA kernel function 'my_cuda_kernel'
-  Pointer argument 'data': weight = 11
-  Scalar argument 'size': weight = 10
-  Scalar argument 'threshold': weight = 5
-  Struct argument 'config': analyzing 3 members
-CudaKernelAnalysis: Analysis completed for function 'my_cuda_kernel'
-```
-
-### Non-CUDA Kernel Function
-
-```
-CudaKernelAnalysis: Function 'normal_function' is not a CUDA kernel, skipping analysis
-```
-
-## Analysis Results
-
-### CudaKernelAnalysisResult Structure
-
-```cpp
-class CudaKernelAnalysisResult {
-  // A map from scalar parameter info to its weight
-  DenseMap<ParameterInfo, int> ScalarWeights;
-  
-  // A map from pointer parameter info to its weight
-  DenseMap<ParameterInfo, int> PointerWeights;
-  
-  // Debug output flag
-  bool DebugOutput;
-  
-  // Helper method
-  SmallVector<std::pair<ParameterInfo, int>, 16> getAllParametersSorted() const;
-};
-
-struct ParameterInfo {
-  std::string Name;                    // Parameter name
-  const Argument *Arg;                 // Pointer to the original argument
-  SmallVector<unsigned, 4> Indices;    // Member indices (length 1 for regular args, >1 for struct members)
-  
-  std::string getDisplayName() const;  // Get formatted display name
-  bool isStructMember() const;         // Check if this is a struct member
-  unsigned getArgIndex() const;        // Get the argument index
-};
-```
-
-### Using in Other Passes
-
-```cpp
-// Get analysis results
-auto &Result = FAM.getResult<CudaKernelAnalysis>(F);
-
-// Access scalar parameters
-for (auto [Param, Weight] : Result.ScalarWeights) {
-  if (Weight > 5) {
-    // Process high-weight scalar parameters
-    // Param.getDisplayName() gives formatted name like "size" or "config[0]"
-    // Param.getArgIndex() gives the argument index (0, 1, 2, etc.)
-    // Param.isStructMember() tells if this is a struct member
-  }
-}
-
-// Access pointer parameters
-for (auto [Param, Weight] : Result.PointerWeights) {
-  if (Weight > 8) {
-    // Add noalias attributes to high-weight pointer parameters
-  }
-}
-
-// Get all parameters sorted by weight
-auto SortedParams = Result.getAllParametersSorted();
-for (auto [Param, Weight] : SortedParams) {
-  // Process parameters in weight order
-}
-
-// Access parameter information
-for (auto [Param, Weight] : Result.ScalarWeights) {
-  // Param.Name - parameter name
-  // Param.Arg - pointer to original argument
-  // Param.Indices - member indices (e.g., [0] for first arg, [1,2] for second arg's third member)
-  // Param.getDisplayName() - formatted name like "data" or "config[0][1]"
-  // Param.isStructMember() - true if indices length > 1
-  // Param.getArgIndex() - first element of indices
-}
-```
-
-## Example CUDA Kernel
-
-```llvm
-%struct.Config = type { i32, %struct.Nested, i32* }
-%struct.Nested = type { float, i32 }
-
-define void @my_cuda_kernel(i32* %data, i32 %size, %struct.Config %config) #0 {
-entry:
-  %0 = extractvalue %struct.Config %config, 0  ; Extract size field
-  %1 = icmp sgt i32 %0, 0                      ; size field used in comparison
-  br i1 %1, label %loop, label %exit           ; comparison result used in branch
-
-loop:
-  %i = phi i32 [ 0, %entry ], [ %i.next, %loop.latch ]
-  %2 = extractvalue %struct.Config %config, 1  ; Extract nested struct
-  %3 = extractvalue %struct.Nested %2, 0       ; Extract float field
-  %4 = extractvalue %struct.Config %config, 2  ; Extract pointer field
-  %val = load i32, i32* %4, align 4            ; pointer used in loop
-  %cmp = icmp slt i32 %val, %0                 ; size field used in comparison
-  br i1 %cmp, label %if.then, label %if.else   ; comparison result used in branch
-  ; ... more code
-}
-
-attributes #0 = { "ptx.kernel"="true" }
-```
-
-Analysis Results:
-- `data` (pointer): weight = 11 (base: 1, loop: 5, load: 3, loop-invariant: 2)
-- `size` (scalar): weight = 10 (direct branch usage)
-- `config[0]` (scalar): weight = 10 (extractvalue + comparison + branch)
-- `config[1][0]` (scalar): weight = 0 (no significant usage)
-- `config[2]` (pointer): weight = 11 (extractvalue + loop + load + loop-invariant)
-
-Index System:
-- `data`: indices = [0] (first argument)
-- `size`: indices = [1] (second argument)
-- `config[0]`: indices = [2, 0] (third argument, first member)
-- `config[1][0]`: indices = [2, 1, 0] (third argument, second member, first sub-member)
-- `config[2]`: indices = [2, 2] (third argument, third member)
+更高的权重代表更值得进行专门化或约束。
 
 ## Implementation Details
 
-### Key Functions
+### 1. Struct(byval) 与指向结构体的指针
+- 对于任何基于指针的访问（无论是普通指针还是 `byval` 参数），分析都会追踪 `getelementptr` (GEP) 指令。
+- **核心逻辑**：通过 `GEP->accumulateConstantOffset()` 计算出每个被访问成员相对于其顶层参数起始地址的**总字节偏移量**。
+- 这种基于偏移量的方法确保了无论结构体在 IR 中如何布局（例如被扁平化），或者 GEP 是基于 `i8` 还是结构体类型，我们都能得到一个稳定且唯一的标识符。
+- 递归处理嵌套结构体：在递归进入下一层结构体时，当前计算出的偏移量会被传递下去，以确保最终叶成员的偏移量是相对于最外层参数的绝对偏移。
 
-#### `analyzeScalarValue(const Value *V, Function &F, FunctionAnalysisManager &AM)`
-- Generic function to analyze any scalar value (arguments or extracted values)
-- Returns weight based on usage in branches and comparisons
-- Higher weights for direct branch usage
+### 2. 直接按值结构体参数（非指针）
+- 若函数签名参数本身是 `struct`（by value），分析会遍历 `extractvalue` 指令。由于 `extractvalue` 直接使用逻辑索引，分析会结合 `DataLayout` 将这些逻辑索引转换为相应的字节偏移量，以保持与基于指针的分析统一。
 
-#### `analyzePointerValue(const Value *V, Function &F, FunctionAnalysisManager &AM)`
-- Generic function to analyze any pointer value (arguments or extracted values)
-- Considers loop usage, memory operations, and loop-invariant properties
-- Returns comprehensive weight for noalias decision making
+### 3. 路径与显示名
+- `ParameterInfo` 保存 `Indices`，其格式为 `[ArgIndex, ByteOffset]`。
+- `getDisplayName()` 用于调试打印，结构体成员以 `name[offset]` 的形式展示。
 
-#### `analyzeStructMembers(const Argument &A, unsigned ArgIndex, Function &F, FunctionAnalysisManager &AM, ...)`
-- Recursively analyzes struct parameters passed by value
-- Tracks `extractvalue` instructions to identify member usage
-- Supports nested structs with index tracking
-- Applies scalar and pointer analysis rules to individual members
+### 4. Debug 输出
+开启 `-debug-only=cuda-kernel-analysis` 可看到：
+- 顶层指针、标量参数的权重。
+- 结构体成员（含 byval）经 GEP/Load 识别并计权的明细，以偏移量（offset）而非索引路径（path）展示。
+- 汇总列表：
+  - Scalar arguments (including struct members)
+  - Pointer arguments (including struct members)
 
-### ParameterInfo Features
-
-#### Index System
-- All parameters have indices, even regular arguments
-- Regular arguments: indices = [ArgIndex] (length 1)
-- Struct members: indices = [ArgIndex, MemberIndex, ...] (length > 1)
-- Example: `[1, 2, 3]` means second argument, third member, fourth sub-member
-
-#### Display Names
-- `getDisplayName()` provides formatted names for debugging
-- Regular args: `"data"`, `"size"`
-- Struct members: `"config[0]"`, `"config[1][2]"`
-
-#### Helper Methods
-- `isStructMember()`: returns true if indices length > 1
-- `getArgIndex()`: returns the first element of indices (argument index)
-
-## Compilation and Installation
-
-### Compile LLVM
-
-```bash
-# In LLVM source directory
-mkdir build && cd build
-cmake -G Ninja -DLLVM_ENABLE_PROJECTS="clang;lld" -DCMAKE_BUILD_TYPE=Release ../llvm
-ninja
+示例（`test_const.cu`）：
+```
+CudaKernelAnalysis: Analyzing CUDA kernel function 'fill_runtime'
+  Pointer argument 'x': weight = 9
+  Struct scalar member offset=4: weight = 5
+  Scalar argument 'size': weight = 8
+  Scalar arguments (including struct members):
+    - indexPath=1.4 name='s[4]' weight=5
+    - indexPath=2 name='size' weight=8
+  Pointer arguments (including struct members):
+    - indexPath=0 name='x' weight=9
+CudaKernelAnalysis: Analysis completed for function 'fill_runtime'
 ```
 
-### Verify Installation
+## Usage
 
+### Run with opt
 ```bash
-# Check if pass is available
-./bin/opt --print-passes | grep cuda-kernel-analysis
-
-# Test pass functionality
-./bin/opt -passes='require<cuda-kernel-analysis>' -debug-only=cuda-kernel-analysis -disable-output test.ll
+./bin/opt -passes='require<cuda-kernel-analysis>' -disable-output input.ll
+# Debug
+./bin/opt -passes='require<cuda-kernel-analysis>' -debug-only=cuda-kernel-analysis -disable-output input.ll
 ```
+
+### Integrate with other passes
+```bash
+# Before transform passes
+./bin/opt -passes='require<cuda-kernel-analysis>,cuda-kernel-const' input.ll
+```
+
+## Test Case: `test_const.cu`
+
+```cuda
+struct MyStruct { int a; int value; };
+extern "C" __global__ void fill_runtime(int *x, MyStruct s, int size) {
+  int idx = threadIdx.x + blockIdx.x * blockDim.x;
+  for (int i = idx; i < size; i += gridDim.x * blockDim.x) {
+    x[i] *= s.value;
+  }
+}
+```
+
+- 期望结果：
+  - `x`（指针，参数0）获得较高指针权重。
+  - `s.value`（struct 成员）：`s` 是参数 1，`value` 在 `a` (4字节)之后，所以其偏移量为 4。分析将产生路径 `[1, 4]` 并为其赋权。
+  - `size`（标量，参数2）获得较高标量权重。
+
+这些结果将作为 `CudaKernelConstPass` 候选集合的基础，后者据此在 `kernels[]` 统计中选择最优常量组合并进行克隆与常量替换。
 
 ## Notes
 
-1. **Performance Impact**: Analysis pass only runs when needed, doesn't affect normal compilation performance
-2. **Debug Output**: Use `-debug-only=cuda-kernel-analysis` for detailed debug information
-3. **Dependencies**: This pass depends on `LoopAnalysis` to analyze pointer usage in loops
-4. **Compatibility**: Supports all LLVM-supported CUDA kernel identification methods
-5. **Struct Analysis**: Handles both named and anonymous struct types
-6. **Nested Structs**: Supports arbitrary nesting depth with index tracking
-7. **Index System**: All parameters have indices for consistent representation
-8. **Separate Maps**: Scalar and pointer parameters are stored in separate maps for easy access
-
-## Extensibility
-
-The pass is designed to be extensible:
-- Can add more weight calculation rules
-- Can extend noalias analysis algorithms
-- Can add other types of parameter analysis
-- Can enhance struct member name resolution using debug information
-- Can add support for array parameters
-- Can extend index tracking for more complex data structures
-
-## Test Cases
-
-The pass includes comprehensive test cases covering:
-- Loop-based kernels with pointer and scalar parameters
-- Branch-based kernels with control flow dependencies
-- Mixed kernels with both loop and branch characteristics
-- Struct-based kernels with various member types
-- Nested struct kernels with complex member access patterns
-- Const-optimized versions of the same kernels
-
-Example test kernels:
-- `_Z11loop_kerneliPf`: Loop kernel with size and data parameters
-- `_Z13branch_kerneliPf`: Branch kernel with flag and data parameters  
-- `_Z12mixed_kerneliiPf`: Mixed kernel with size, flag, and data parameters
-- `_Z15struct_kernel_config`: Struct-based kernel with Config parameter
-- `_Z20nested_struct_kernel_config`: Nested struct kernel with complex member access
+1. 依赖 `LoopAnalysis` 以识别循环内使用与不变性。
+2. 通过 `accumulateConstantOffset` 统一处理不同形式的 GEP，无需区分 `i8` 或结构体类型，增强了稳健性。

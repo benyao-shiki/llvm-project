@@ -25,6 +25,10 @@
 #include <cstdlib>
 #include <vector>
 #include <cstring>
+#include <sys/file.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
 
 using namespace clang;
 using namespace CodeGen;
@@ -34,6 +38,23 @@ using namespace CodeGen;
 //===----------------------------------------------------------------------===//
 
 namespace {
+struct FileSharedLockGuard {
+  int Fd;
+  bool Ok;
+  FileSharedLockGuard(const std::string &Path) : Fd(-1), Ok(false) {
+    std::string LockPath = Path + ".lock";
+    Fd = ::open(LockPath.c_str(), O_CREAT | O_RDWR, 0666);
+    if (Fd != -1) {
+      int Ret;
+      do { Ret = ::flock(Fd, LOCK_SH); } while (Ret != 0 && errno == EINTR);
+      if (Ret == 0) Ok = true; else { ::close(Fd); Fd = -1; }
+    }
+  }
+  ~FileSharedLockGuard() {
+    if (Fd != -1) { ::flock(Fd, LOCK_UN); ::close(Fd); }
+  }
+  bool acquired() const { return Ok; }
+};
 struct KernelProfileInfo {
   std::vector<unsigned> TargetPointerIndices; ///< Pointer parameter indices
 };
@@ -42,6 +63,7 @@ struct ScalarConstInfo {
   unsigned index;     // Argument index (0-based)
   std::string value;  // Common constant value as string
   double ratio;       // Frequency ratio (0.0 to 1.0)
+  std::vector<unsigned> indices; // Full indices path (e.g., [arg, member...])
 };
 
 struct KernelConstProfileInfo {
@@ -50,6 +72,7 @@ struct KernelConstProfileInfo {
 
 static llvm::StringMap<KernelProfileInfo> KernelProfileMap;
 static llvm::StringMap<KernelConstProfileInfo> KernelConstProfileMap;
+static llvm::StringMap<std::vector<std::vector<unsigned>>> KernelNoaliasProfileMap; // kernel -> list of indices paths
 static bool KernelProfileLoaded = false;
 
 static void loadCudaKernelProfile(const CodeGenModule &CGM) {
@@ -78,6 +101,8 @@ static void loadCudaKernelProfile(const CodeGenModule &CGM) {
   if (ProfilePath.empty())
     return; // Silently give up – no profile info available.
 
+  FileSharedLockGuard ReadLock(ProfilePath);
+
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> BufferOrErr =
       llvm::MemoryBuffer::getFile(ProfilePath);
   if (!BufferOrErr)
@@ -92,72 +117,149 @@ static void loadCudaKernelProfile(const CodeGenModule &CGM) {
   if (!RootObj)
     return;
 
-  if (llvm::json::Array *HotKernels = RootObj->getArray("hot_kernels")) {
-    for (llvm::json::Value &HKVal : *HotKernels) {
-      llvm::json::Object *HKObj = HKVal.getAsObject();
-      if (!HKObj)
-        continue;
-      auto NameVal = HKObj->getString("name");
-      if (!NameVal)
-        continue;
+  // 0) Prefer cuda_const_selected if present; it contains final device-side selections.
+  {
+    auto addConstItem = [&](llvm::StringRef Kernel, std::vector<unsigned> Indices, std::string ValueStr) {
+      KernelConstProfileInfo &Slot = KernelConstProfileMap[Kernel];
+      ScalarConstInfo Item;
+      Item.index = Indices.empty() ? 0u : Indices.front();
+      Item.value = std::move(ValueStr);
+      Item.ratio = 1.0; // final selection – treat as always-on
+      Item.indices = std::move(Indices);
+      Slot.commonScalars.push_back(std::move(Item));
+    };
 
-      KernelProfileInfo Info;
-      if (llvm::json::Array *NoaliasArr = HKObj->getArray("noalias_pointers")) {
-        for (llvm::json::Value &PtrVal : *NoaliasArr) {
-          llvm::json::Object *PtrObj = PtrVal.getAsObject();
-          if (!PtrObj)
-            continue;
-          auto ArgVal = PtrObj->get("arg");
-          if (!ArgVal)
-            continue;
-          if (auto ArgInt = ArgVal->getAsInteger())
-            Info.TargetPointerIndices.push_back(static_cast<unsigned>(*ArgInt));
+    if (llvm::json::Object *SelObj = RootObj->getObject("cuda_const_selected")) {
+      for (auto &KV : *SelObj) {
+        llvm::StringRef KernelName = KV.first;
+        if (llvm::json::Array *Arr = KV.second.getAsArray()) {
+          for (const llvm::json::Value &V : *Arr) {
+            if (const llvm::json::Object *O = V.getAsObject()) {
+              // Accept shapes: index (int), indices (array), param_index (int|array)
+              std::vector<unsigned> IndicesVec;
+              if (auto Indices = O->getArray("indices")) {
+                for (const auto &X : *Indices) if (auto I = X.getAsInteger()) IndicesVec.push_back((unsigned)*I);
+              } else if (auto PIi = O->getInteger("param_index")) {
+                IndicesVec.push_back((unsigned)*PIi);
+              } else if (auto PIArr = O->getArray("param_index")) {
+                for (const auto &X : *PIArr) if (auto I = X.getAsInteger()) IndicesVec.push_back((unsigned)*I);
+              } else if (auto Idx = O->getInteger("index")) {
+                IndicesVec.push_back((unsigned)*Idx);
+              } else {
+                continue;
+              }
+ 
+              std::string ValueStr;
+              if (auto S = O->getString("value")) {
+                ValueStr = S->str();
+              } else if (auto N = O->get("value")) {
+                if (auto Num = N->getAsNumber())
+                  ValueStr = llvm::Twine((long long)*Num).str();
+                else
+                  continue;
+              } else {
+                continue;
+              }
+              addConstItem(KernelName, std::move(IndicesVec), std::move(ValueStr));
+            }
+          }
         }
       }
-      if (!Info.TargetPointerIndices.empty())
-        KernelProfileMap[*NameVal] = std::move(Info);
-      
-      // Parse common_scalars for constant propagation
-      KernelConstProfileInfo ConstInfo;
-      if (llvm::json::Array *ScalarsArr = HKObj->getArray("common_scalars")) {
-        for (llvm::json::Value &ScalarVal : *ScalarsArr) {
-          llvm::json::Object *ScalarObj = ScalarVal.getAsObject();
-          if (!ScalarObj)
+    } else if (const llvm::json::Array *SelArr = RootObj->getArray("cuda_const_selected")) {
+      for (const llvm::json::Value &Elem : *SelArr) {
+        if (const llvm::json::Object *Obj = Elem.getAsObject()) {
+          // Accept shapes like {"name": kernel, "selected": [...]}
+          llvm::StringRef KName;
+          if (auto KS = Obj->getString("name"))
+            KName = *KS;
+          else if (auto KS2 = Obj->getString("kernel"))
+            KName = *KS2;
+          else
             continue;
-          
-          ScalarConstInfo SCI;
-          if (auto ArgVal = ScalarObj->get("arg")) {
-            if (auto ArgInt = ArgVal->getAsInteger()) {
-              SCI.index = static_cast<unsigned>(*ArgInt);
-            } else {
-              continue;
+          if (const llvm::json::Array *Arr = Obj->getArray("selected")) {
+            for (const llvm::json::Value &V : *Arr) {
+              if (const llvm::json::Object *O = V.getAsObject()) {
+                std::vector<unsigned> IndicesVec;
+                if (auto Indices = O->getArray("indices")) {
+                  for (const auto &X : *Indices) if (auto I = X.getAsInteger()) IndicesVec.push_back((unsigned)*I);
+                } else if (auto PIi = O->getInteger("param_index")) {
+                  IndicesVec.push_back((unsigned)*PIi);
+                } else if (auto PIArr = O->getArray("param_index")) {
+                  for (const auto &X : *PIArr) if (auto I = X.getAsInteger()) IndicesVec.push_back((unsigned)*I);
+                } else if (auto Idx = O->getInteger("index")) {
+                  IndicesVec.push_back((unsigned)*Idx);
+                } else {
+                  continue;
+                }
+                std::string ValueStr;
+                if (auto S = O->getString("value")) {
+                  ValueStr = S->str();
+                } else if (auto N = O->get("value")) {
+                  if (auto Num = N->getAsNumber())
+                    ValueStr = llvm::Twine((long long)*Num).str();
+                  else
+                    continue;
+                } else {
+                  continue;
+                }
+                addConstItem(KName, std::move(IndicesVec), std::move(ValueStr));
+              }
             }
-          } else {
-            continue;
           }
-          
-          if (auto ValueVal = ScalarObj->getString("value")) {
-            SCI.value = *ValueVal;
-          } else {
-            continue;
-          }
-          
-          if (auto RatioVal = ScalarObj->get("ratio")) {
-            if (auto RatioNum = RatioVal->getAsNumber()) {
-              SCI.ratio = *RatioNum;
-            } else {
-              SCI.ratio = 1.0;
-            }
-          } else {
-            SCI.ratio = 1.0;
-          }
-          
-          ConstInfo.commonScalars.push_back(SCI);
         }
       }
-      
-      if (!ConstInfo.commonScalars.empty())
-        KernelConstProfileMap[*NameVal] = std::move(ConstInfo);
+    }
+  }
+
+  // Legacy 'hot_kernels' parsing removed entirely. Use 'cuda_const_selected' (and in future 'cuda_noalias_selected').
+
+  // Parse cuda_noalias_selected (object or array forms)
+  if (llvm::json::Object *NoObj = RootObj->getObject("cuda_noalias_selected")) {
+    for (auto &KV : *NoObj) {
+      llvm::StringRef KernelName = KV.first;
+      if (llvm::json::Array *Arr = KV.second.getAsArray()) {
+        for (const llvm::json::Value &V : *Arr) {
+          if (const llvm::json::Object *O = V.getAsObject()) {
+            std::vector<unsigned> Indices;
+            if (auto Idxs = O->getArray("indices")) {
+              for (const auto &X : *Idxs) if (auto I = X.getAsInteger()) Indices.push_back((unsigned)*I);
+            } else if (auto PI = O->getInteger("param_index")) {
+              Indices.push_back((unsigned)*PI);
+            } else if (auto PIA = O->getArray("param_index")) {
+              for (const auto &X : *PIA) if (auto I = X.getAsInteger()) Indices.push_back((unsigned)*I);
+            } else if (auto Idx = O->getInteger("index")) {
+              Indices.push_back((unsigned)*Idx);
+            }
+            if (!Indices.empty()) KernelNoaliasProfileMap[KernelName].push_back(std::move(Indices));
+          }
+        }
+      }
+    }
+  } else if (const llvm::json::Array *NoArr = RootObj->getArray("cuda_noalias_selected")) {
+    for (const llvm::json::Value &Elem : *NoArr) {
+      if (const llvm::json::Object *Obj = Elem.getAsObject()) {
+        llvm::StringRef KName;
+        if (auto KS = Obj->getString("name")) KName = *KS;
+        else if (auto KS2 = Obj->getString("kernel")) KName = *KS2;
+        else continue;
+        if (const llvm::json::Array *Arr = Obj->getArray("selected")) {
+          for (const llvm::json::Value &V : *Arr) {
+            if (const llvm::json::Object *O = V.getAsObject()) {
+              std::vector<unsigned> Indices;
+              if (auto Idxs = O->getArray("indices")) {
+                for (const auto &X : *Idxs) if (auto I = X.getAsInteger()) Indices.push_back((unsigned)*I);
+              } else if (auto PI = O->getInteger("param_index")) {
+                Indices.push_back((unsigned)*PI);
+              } else if (auto PIA = O->getArray("param_index")) {
+                for (const auto &X : *PIA) if (auto I = X.getAsInteger()) Indices.push_back((unsigned)*I);
+              } else if (auto Idx = O->getInteger("index")) {
+                Indices.push_back((unsigned)*Idx);
+              }
+              if (!Indices.empty()) KernelNoaliasProfileMap[KName].push_back(std::move(Indices));
+            }
+          }
+        }
+      }
     }
   }
 }
@@ -188,11 +290,14 @@ RValue CGCUDARuntime::EmitCUDAKernelCallExpr(CodeGenFunction &CGF,
      // Check if we need to generate conditional logic for const propagation
      loadCudaKernelProfile(CGF.CGM);
 
-         // Retrieve mangled kernel name to match profile
+         // Retrieve names to match profile (mangled and simple)
      std::string MangledName = CGF.CGM.getMangledName(GlobalDecl(FD)).str();
+     std::string SimpleName = FD->getNameAsString();
      auto ConstProfileIt = KernelConstProfileMap.find(MangledName);
+     if (ConstProfileIt == KernelConstProfileMap.end())
+       ConstProfileIt = KernelConstProfileMap.find(SimpleName);
 
-          if (ConstProfileIt == KernelConstProfileMap.end()) {
+      if (ConstProfileIt == KernelConstProfileMap.end()) {
         // Try without the __device_stub__ prefix which Clang adds to host stubs.
         llvm::StringRef NameRef(MangledName);
         size_t StubPos = NameRef.find("__device_stub__");
@@ -206,6 +311,16 @@ RValue CGCUDARuntime::EmitCUDAKernelCallExpr(CodeGenFunction &CGF,
             }
           }
         }
+       // Also try matching by simple name suffix
+       if (ConstProfileIt == KernelConstProfileMap.end()) {
+         for (auto It = KernelConstProfileMap.begin(); It != KernelConstProfileMap.end(); ++It) {
+           if (llvm::StringRef(It->getKey()) == SimpleName ||
+               llvm::StringRef(It->getKey()).ends_with(SimpleName)) {
+             ConstProfileIt = It;
+             break;
+           }
+         }
+       }
       }
 
          if (ConstProfileIt != KernelConstProfileMap.end()) {
@@ -235,9 +350,16 @@ RValue CGCUDARuntime::EmitCUDAKernelCallExpr(CodeGenFunction &CGF,
          Address ExpectedArray = CGF.CreateTempAlloca(Int64ArrayTy, CGF.getPointerAlign(), "expected_values");
          Address ActualArray = CGF.CreateTempAlloca(Int64ArrayTy, CGF.getPointerAlign(), "actual_values");
          
-         // Fill expected values
+         // Fill expected values (support integer or floating literal strings)
          for (size_t i = 0; i < Profile.commonScalars.size(); ++i) {
-           int64_t ExpectedValue = std::stoll(Profile.commonScalars[i].value);
+           const std::string &S = Profile.commonScalars[i].value;
+           int64_t ExpectedValue = 0;
+           if (S.find_first_of(".eE") != std::string::npos) {
+             double dv = std::stod(S);
+             ExpectedValue = static_cast<int64_t>(dv);
+           } else {
+             ExpectedValue = std::stoll(S);
+           }
            llvm::Value *ExpectedVal = llvm::ConstantInt::get(CGF.Builder.getInt64Ty(), ExpectedValue);
            llvm::Value *ExpectedPtr = CGF.Builder.CreateInBoundsGEP(
                Int64ArrayTy, ExpectedArray.emitRawPointer(CGF), {CGF.Builder.getInt32(0), CGF.Builder.getInt32(i)});
@@ -247,20 +369,52 @@ RValue CGCUDARuntime::EmitCUDAKernelCallExpr(CodeGenFunction &CGF,
          
          // Fill actual values from function arguments
          for (size_t i = 0; i < Profile.commonScalars.size(); ++i) {
-           unsigned ArgIndex = Profile.commonScalars[i].index;
-           if (ArgIndex < E->getNumArgs()) {
-             llvm::Value *ActualVal = CGF.EmitAnyExpr(E->getArg(ArgIndex)).getScalarVal();
-             // Convert to int64
-             if (ActualVal->getType()->isIntegerTy()) {
-               ActualVal = CGF.Builder.CreateSExtOrTrunc(ActualVal, CGF.Builder.getInt64Ty());
-             } else if (ActualVal->getType()->isFloatingPointTy()) {
-               ActualVal = CGF.Builder.CreateFPToSI(ActualVal, CGF.Builder.getInt64Ty());
-             }
-             llvm::Value *ActualPtr = CGF.Builder.CreateInBoundsGEP(
-                 Int64ArrayTy, ActualArray.emitRawPointer(CGF), {CGF.Builder.getInt32(0), CGF.Builder.getInt32(i)});
-             Address ActualAddr = Address(ActualPtr, CGF.Builder.getInt64Ty(), CGF.getPointerAlign());
-             CGF.Builder.CreateStore(ActualVal, ActualAddr);
+           const ScalarConstInfo &SCI = Profile.commonScalars[i];
+           const std::vector<unsigned> &Path = SCI.indices;
+           if (Path.empty()) continue;
+ 
+           unsigned ArgIndex = Path[0];
+           if (ArgIndex >= E->getNumArgs()) continue;
+           const Expr *ArgE = E->getArg(ArgIndex);
+ 
+           llvm::Value *ActualVal = nullptr;
+           if (Path.size() == 1 || (Path.size() == 2 && Path[1] == 0)) {
+             // This is a top-level scalar argument.
+             ActualVal = CGF.EmitAnyExpr(ArgE).getScalarVal();
+           } else if (Path.size() == 2) {
+             // This is a struct member, identified by byte offset.
+             uint64_t Offset = Path[1];
+             LValue BaseLV = CGF.EmitLValue(ArgE);
+             llvm::Value *BasePtr = BaseLV.getPointer(CGF);
+             llvm::Value *OffsetVal = llvm::ConstantInt::get(CGF.SizeTy, Offset);
+
+             // GEP on the i8* pointer
+             llvm::Value *GEPPtr = CGF.Builder.CreateInBoundsGEP(
+                 CGF.Builder.getInt8Ty(), BasePtr, OffsetVal);
+
+             // We need to know the type of the member to load.
+             // This is tricky without the FieldDecl. We assume for now it's a 64-bit integer
+             // as that's what the check function expects.
+             llvm::Type *DestPtrTy = llvm::PointerType::getUnqual(CGF.Builder.getInt64Ty());
+             llvm::Value *CastedPtr = CGF.Builder.CreateBitCast(GEPPtr, DestPtrTy);
+             
+             ActualVal = CGF.Builder.CreateLoad(Address(CastedPtr, CGF.Builder.getInt64Ty(), CGF.getPointerAlign()));
            }
+
+           if (!ActualVal) continue;
+
+           // Convert to int64 for the check function
+           if (ActualVal->getType()->isIntegerTy()) {
+             ActualVal = CGF.Builder.CreateSExtOrTrunc(ActualVal, CGF.Builder.getInt64Ty());
+           } else if (ActualVal->getType()->isFloatingPointTy()) {
+             ActualVal = CGF.Builder.CreateFPToSI(ActualVal, CGF.Builder.getInt64Ty());
+           } else {
+             continue;
+           }
+           llvm::Value *ActualPtr = CGF.Builder.CreateInBoundsGEP(
+               Int64ArrayTy, ActualArray.emitRawPointer(CGF), {CGF.Builder.getInt32(0), CGF.Builder.getInt32(i)});
+           Address ActualAddr = Address(ActualPtr, CGF.Builder.getInt64Ty(), CGF.getPointerAlign());
+           CGF.Builder.CreateStore(ActualVal, ActualAddr);
          }
          
          // Get pointers to arrays
@@ -341,27 +495,29 @@ RValue CGCUDARuntime::EmitCUDAKernelCallExpr(CodeGenFunction &CGF,
 
     // Retrieve mangled kernel name to match profile (device stub shares name)
     std::string MangledName = CGF.CGM.getMangledName(GlobalDecl(FD)).str();
-    auto ProfileIt = KernelProfileMap.find(MangledName);
-
-    if (ProfileIt == KernelProfileMap.end()) {
-      // Try without the __device_stub__ prefix which Clang adds to host stubs.
+    auto NAIt = KernelNoaliasProfileMap.find(MangledName);
+    if (NAIt == KernelNoaliasProfileMap.end()) {
+      // Try without the __device_stub__ prefix
       llvm::StringRef NameRef(MangledName);
       size_t StubPos = NameRef.find("__device_stub__");
       if (StubPos != llvm::StringRef::npos) {
         llvm::StringRef Suffix = NameRef.substr(StubPos + strlen("__device_stub__"));
-        // Try to find any kernel whose mangled name ends with the suffix.
-        for (auto It = KernelProfileMap.begin(); It != KernelProfileMap.end(); ++It) {
-          if (llvm::StringRef(It->getKey()).ends_with(Suffix)) {
-            ProfileIt = It;
-            break;
+        for (auto It = KernelNoaliasProfileMap.begin(); It != KernelNoaliasProfileMap.end(); ++It) {
+          if (llvm::StringRef(It->getKey()).ends_with(Suffix)) { NAIt = It; break; }
+        }
+      }
+      // Also try simple name
+      if (NAIt == KernelNoaliasProfileMap.end()) {
+        std::string SimpleName = FD->getNameAsString();
+        for (auto It = KernelNoaliasProfileMap.begin(); It != KernelNoaliasProfileMap.end(); ++It) {
+          if (llvm::StringRef(It->getKey()) == SimpleName || llvm::StringRef(It->getKey()).ends_with(SimpleName)) {
+            NAIt = It; break;
           }
         }
       }
     }
 
-    // If no profile information or no target pointers recorded, fall back.
-    if (ProfileIt == KernelProfileMap.end() ||
-        ProfileIt->second.TargetPointerIndices.empty()) {
+    if (NAIt == KernelNoaliasProfileMap.end() || NAIt->second.empty()) {
       CGF.EmitSimpleCallExpr(E, ReturnValue, CallOrInvoke);
       CGF.EmitBranch(ContBlock);
       CGF.EmitBlock(ContBlock);
@@ -369,263 +525,116 @@ RValue CGCUDARuntime::EmitCUDAKernelCallExpr(CodeGenFunction &CGF,
       return RValue::get(nullptr);
     }
 
-    const std::vector<unsigned> &TargetIndices =
-        ProfileIt->second.TargetPointerIndices;
+    // Build targets/others pointer arrays from callsite
+    llvm::SmallVector<llvm::Value*, 8> TargetPtrs;
+    llvm::SmallVector<llvm::Value*, 8> OtherPtrs;
+
+    auto EmitPtrFromIndices = [&](const std::vector<unsigned> &IdxVec) -> llvm::Value* {
+      if (IdxVec.empty()) return nullptr;
+      unsigned ArgIndex = IdxVec[0];
+      if (ArgIndex >= E->getNumArgs()) return nullptr;
+      const Expr *ArgE = E->getArg(ArgIndex);
+
+      if (IdxVec.size() == 1 || (IdxVec.size() == 2 && IdxVec[1] == 0)) {
+        // Top-level pointer argument
+        if (!ArgE->getType()->isPointerType()) return nullptr;
+        return CGF.EmitScalarExpr(ArgE);
+      }
+
+      if (IdxVec.size() == 2) {
+        // Pointer is a struct member, identified by byte offset.
+        uint64_t Offset = IdxVec[1];
+        LValue LV = CGF.EmitLValue(ArgE);
+        if (const auto *RT = LV.getType()->getAs<RecordType>()) {
+          const RecordDecl *RD = RT->getDecl();
+          const ASTContext &ASTCtx = CGF.getContext();
+          const ASTRecordLayout &Layout = ASTCtx.getASTRecordLayout(RD);
+
+          const FieldDecl *FD = nullptr;
+          unsigned FieldNo = 0;
+          for (const FieldDecl *Field : RD->fields()) {
+            if (Layout.getFieldOffset(FieldNo) / 8 == Offset) {
+              FD = Field;
+              break;
+            }
+            FieldNo++;
+          }
+
+          if (FD && FD->getType()->isPointerType()) {
+            LValue MemberLV = CGF.EmitLValueForField(LV, FD);
+            return CGF.EmitLoadOfScalar(MemberLV.getAddress(), /*Volatile=*/false,
+                                      FD->getType(), E->getExprLoc());
+          }
+        }
+      }
+      return nullptr;
+    };
+
+    // targets from selected indices
+    for (const auto &Idx : NAIt->second) {
+      if (llvm::Value *P = EmitPtrFromIndices(Idx)) TargetPtrs.push_back(P);
+    }
+    // others: all pointer args not in targets
+    for (unsigned i = 0; i < E->getNumArgs(); ++i) {
+      const Expr *Arg = E->getArg(i); if (!Arg->getType()->isPointerType()) continue;
+      bool IsTarget = false;
+      for (const auto &Idx : NAIt->second) {
+        if (Idx.empty()) continue;
+        if (Idx[0] != i) continue;
+        if (Idx.size() == 1 || (Idx.size() == 2 && Idx[1] == 0)) { IsTarget = true; break; }
+      }
+      if (!IsTarget) OtherPtrs.push_back(CGF.EmitScalarExpr(Arg));
+    }
+
+    auto createPtrArray = [&](llvm::ArrayRef<llvm::Value*> Ptrs, const llvm::Twine &Name) -> llvm::Value* {
+      if (Ptrs.empty()) return llvm::ConstantPointerNull::get(llvm::PointerType::getUnqual(CGF.CGM.Int8PtrTy));
+      llvm::ArrayType *ArrTy = llvm::ArrayType::get(CGF.CGM.Int8PtrTy, Ptrs.size());
+      llvm::AllocaInst *ArrAlloca = CGF.Builder.CreateAlloca(ArrTy, nullptr, Name);
+      llvm::Value *Zero = llvm::ConstantInt::get(CGF.IntTy, 0);
+      for (unsigned idx = 0; idx < Ptrs.size(); ++idx) {
+        llvm::Value *CastPtr = CGF.Builder.CreateBitCast(Ptrs[idx], CGF.CGM.Int8PtrTy);
+        llvm::Value *ElemPtr = CGF.Builder.CreateInBoundsGEP(ArrTy, ArrAlloca, {Zero, llvm::ConstantInt::get(CGF.IntTy, idx)});
+        CGF.Builder.CreateDefaultAlignedStore(CastPtr, ElemPtr);
+      }
+      llvm::Value *FirstElemPtr = CGF.Builder.CreateInBoundsGEP(ArrTy, ArrAlloca, {Zero, Zero});
+      llvm::Type *Int8PtrPtrTy = llvm::PointerType::getUnqual(CGF.CGM.Int8PtrTy);
+      return CGF.Builder.CreateBitCast(FirstElemPtr, Int8PtrPtrTy);
+    };
+
+    llvm::Value *TargetsPtr = createPtrArray(TargetPtrs, "targets");
+    llvm::Value *OthersPtr  = createPtrArray(OtherPtrs,  "others");
+
+    llvm::Type *IntTy = CGF.IntTy; // i32
+    llvm::Type *Int8PtrPtrTy = llvm::PointerType::getUnqual(CGF.CGM.Int8PtrTy);
+    // bool check_ptr_sets(int, i8**, int, i8**)
+    llvm::FunctionType *CheckPtrTy = llvm::FunctionType::get(
+        CGF.Builder.getInt1Ty(), {IntTy, Int8PtrPtrTy, IntTy, Int8PtrPtrTy}, false);
+    llvm::FunctionCallee CheckPtrFn = CGF.CGM.CreateRuntimeFunction(CheckPtrTy, "check_ptr_sets");
+
+    llvm::Value *NumTargets = llvm::ConstantInt::get(IntTy, TargetPtrs.size());
+    llvm::Value *NumOthers  = llvm::ConstantInt::get(IntTy, OtherPtrs.size());
+    llvm::CallBase *AliasCall = CGF.EmitRuntimeCallOrInvoke(CheckPtrFn, {NumTargets, TargetsPtr, NumOthers, OthersPtr});
+    llvm::Value *NoAlias = CGF.Builder.CreateNot(AliasCall, "noalias");
 
     llvm::BasicBlock *useNoaliasBlock = CGF.createBasicBlock("use_noalias");
     llvm::BasicBlock *useOriginalBlock = CGF.createBasicBlock("use_original");
-    llvm::BasicBlock *afterKernelCallBlock =
-        CGF.createBasicBlock("after_kernel_call");
+    llvm::BasicBlock *afterKernelCallBlock = CGF.createBasicBlock("after_kernel_call");
+    CGF.Builder.CreateCondBr(NoAlias, useNoaliasBlock, useOriginalBlock);
 
-    // Separate pointer arguments into target set and other set.
-    llvm::SmallVector<llvm::Value *, 8> TargetPtrs;
-    llvm::SmallVector<llvm::Value *, 8> OtherPtrs;
-
-    for (unsigned i = 0; i < E->getNumArgs(); ++i) {
-      const Expr *Arg = E->getArg(i);
-      if (!Arg->getType()->isPointerType())
-        continue;
-      llvm::Value *ArgVal = CGF.EmitScalarExpr(Arg);
-      if (llvm::is_contained(TargetIndices, i))
-        TargetPtrs.push_back(ArgVal);
-      else
-        OtherPtrs.push_back(ArgVal);
-    }
-
-    // Generate runtime alias check whenever there is at least one target pointer.
-    llvm::Value *noAliasCondition = nullptr;
-    if (!TargetPtrs.empty()) {
-      auto createPtrArray = [&](llvm::ArrayRef<llvm::Value *> Ptrs,
-                                const llvm::Twine &Name) -> llvm::Value * {
-        if (Ptrs.empty())
-          return llvm::ConstantPointerNull::get(
-              llvm::PointerType::getUnqual(CGF.CGM.Int8PtrTy));
-
-        llvm::ArrayType *ArrTy =
-            llvm::ArrayType::get(CGF.CGM.Int8PtrTy, Ptrs.size());
-        llvm::AllocaInst *ArrAlloca =
-            CGF.Builder.CreateAlloca(ArrTy, nullptr, Name);
-        llvm::Value *Zero = llvm::ConstantInt::get(CGF.IntTy, 0);
-        for (unsigned idx = 0; idx < Ptrs.size(); ++idx) {
-          llvm::Value *CastPtr =
-              CGF.Builder.CreateBitCast(Ptrs[idx], CGF.CGM.Int8PtrTy);
-          llvm::Value *ElemPtr = CGF.Builder.CreateInBoundsGEP(
-              ArrTy, ArrAlloca,
-              {Zero, llvm::ConstantInt::get(CGF.IntTy, idx)});
-          CGF.Builder.CreateDefaultAlignedStore(CastPtr, ElemPtr);
-        }
-        llvm::Value *FirstElemPtr = CGF.Builder.CreateInBoundsGEP(
-            ArrTy, ArrAlloca, {Zero, Zero});
-        llvm::Type *Int8PtrPtrTy =
-            llvm::PointerType::getUnqual(CGF.CGM.Int8PtrTy);
-        return CGF.Builder.CreateBitCast(FirstElemPtr, Int8PtrPtrTy);
-      };
-
-      llvm::Value *TargetsPtr = createPtrArray(TargetPtrs, "targets");
-      llvm::Value *OthersPtr = createPtrArray(OtherPtrs, "others");
-
-      llvm::Type *IntTy = CGF.IntTy; // i32
-      llvm::Type *Int8PtrPtrTy = llvm::PointerType::getUnqual(CGF.CGM.Int8PtrTy);
-
-      // bool check_ptr_sets(int, i8**, int, i8**)
-      llvm::FunctionType *CheckPtrTy = llvm::FunctionType::get(
-          CGF.Builder.getInt1Ty(), {IntTy, Int8PtrPtrTy, IntTy, Int8PtrPtrTy},
-          /*isVarArg=*/false);
-      llvm::FunctionCallee CheckPtrFn =
-          CGF.CGM.CreateRuntimeFunction(CheckPtrTy, "check_ptr_sets");
-
-      llvm::Value *NumTargets =
-          llvm::ConstantInt::get(IntTy, TargetPtrs.size());
-      llvm::Value *NumOthers = llvm::ConstantInt::get(IntTy, OtherPtrs.size());
-
-      llvm::CallBase *AliasCall = CGF.EmitRuntimeCallOrInvoke(
-          CheckPtrFn, {NumTargets, TargetsPtr, NumOthers, OthersPtr});
-
-      // AliasCall == true  => aliasing exists  => use ORIGINAL kernel
-      // AliasCall == false => no aliasing      => use NOALIAS kernel
-      noAliasCondition = CGF.Builder.CreateNot(AliasCall, "noalias");
-    } else {
-      // No target pointer recorded – fall back conservatively.
-      noAliasCondition = llvm::ConstantInt::getFalse(CGF.Builder.getContext());
-    }
-
-    CGF.Builder.CreateCondBr(noAliasCondition, useNoaliasBlock,
-                             useOriginalBlock);
-
-    //===------------------------------------------------------------------===//
-    // Noalias branch – call the specialised stub with suffix "_noalias".
-    //===------------------------------------------------------------------===//
+    // _noalias branch
     CGF.EmitBlock(useNoaliasBlock);
-    const Expr *Callee = E->getCallee();
-    // Strip away implicit casts to get to the underlying DeclRefExpr
-    const Expr *UnderlyingCallee = Callee->IgnoreParenImpCasts();
-    
-    if (const DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(UnderlyingCallee)) {
-      if (const FunctionDecl *CalledFD = dyn_cast<FunctionDecl>(DRE->getDecl())) {
-        std::string NoaliasStubName =
-            CGF.CGM.getMangledName(GlobalDecl(CalledFD)).str() + "_noalias";
-        if (llvm::Function *NoaliasStub =
-                CGF.CGM.getModule().getFunction(NoaliasStubName)) {
-          CallArgList Args;
-          for (const Expr *Arg : E->arguments())
-            Args.add(CGF.EmitAnyExpr(Arg), Arg->getType());
-
-          const CGFunctionInfo &FnInfo = CGF.CGM.getTypes().arrangeFreeFunctionCall(
-              Args, CalledFD->getType()->castAs<FunctionType>(), /*ChainCall=*/false);
-          CGF.EmitCall(FnInfo, CGCallee::forDirect(NoaliasStub), ReturnValueSlot(),
-                       Args);
-        } else {
-          // Fallback – noalias stub missing.
-          CGF.EmitSimpleCallExpr(E, ReturnValue, CallOrInvoke);
-        }
-      } else {
-        CGF.EmitSimpleCallExpr(E, ReturnValue, CallOrInvoke);
-      }
-    } else {
-      CGF.EmitSimpleCallExpr(E, ReturnValue, CallOrInvoke);
-    }
-    CGF.EmitBranch(afterKernelCallBlock);
-
-    //===------------------------------------------------------------------===//
-    // Original branch
-    //===------------------------------------------------------------------===//
-    CGF.EmitBlock(useOriginalBlock);
-    CGF.EmitSimpleCallExpr(E, ReturnValue, CallOrInvoke);
-    CGF.EmitBranch(afterKernelCallBlock);
-
-    CGF.EmitBlock(afterKernelCallBlock);
-  } else if (FD && CGF.CGM.getCodeGenOpts().CudaKernelConst) {
-    // Check if we need to generate conditional logic for const propagation
-    loadCudaKernelProfile(CGF.CGM);
-
-    // Retrieve mangled kernel name to match profile
-    std::string MangledName = CGF.CGM.getMangledName(GlobalDecl(FD)).str();
-    auto ConstProfileIt = KernelConstProfileMap.find(MangledName);
-
-    if (ConstProfileIt == KernelConstProfileMap.end()) {
-      // Try without the __device_stub__ prefix
-      llvm::StringRef NameRef(MangledName);
-      size_t StubPos = NameRef.find("__device_stub__");
-      if (StubPos != llvm::StringRef::npos) {
-        llvm::StringRef Suffix = NameRef.substr(StubPos + strlen("__device_stub__"));
-        for (auto It = KernelConstProfileMap.begin(); It != KernelConstProfileMap.end(); ++It) {
-          if (llvm::StringRef(It->getKey()).ends_with(Suffix)) {
-            ConstProfileIt = It;
-            break;
-          }
-        }
-      }
-    }
-
-    // If no profile information or no common scalars, fall back to original
-    if (ConstProfileIt == KernelConstProfileMap.end() ||
-        ConstProfileIt->second.commonScalars.empty()) {
-      CGF.EmitSimpleCallExpr(E, ReturnValue, CallOrInvoke);
-    } else {
-      const std::vector<ScalarConstInfo> &CommonScalars = ConstProfileIt->second.commonScalars;
-
-      llvm::BasicBlock *useConstBlock = CGF.createBasicBlock("use_const");
-      llvm::BasicBlock *useOriginalBlock = CGF.createBasicBlock("use_original");
-      llvm::BasicBlock *afterConstCallBlock = CGF.createBasicBlock("after_const_call");
-
-      // Create runtime check for constant values
-      llvm::Value *constCondition = nullptr;
-      if (!CommonScalars.empty()) {
-        // Create arrays for expected values and actual values
-        llvm::SmallVector<llvm::Value *, 8> ExpectedValues;
-        llvm::SmallVector<llvm::Value *, 8> ActualValues;
-
-        for (const ScalarConstInfo &SCI : CommonScalars) {
-          if (SCI.index < E->getNumArgs()) {
-            const Expr *Arg = E->getArg(SCI.index);
-            llvm::Value *ActualVal = CGF.EmitScalarExpr(Arg);
-            ActualValues.push_back(ActualVal);
-            
-            // Create expected constant value
-            llvm::Value *ExpectedVal = nullptr;
-            if (Arg->getType()->isIntegerType()) {
-              int64_t val = std::stoll(SCI.value);
-              ExpectedVal = llvm::ConstantInt::get(ActualVal->getType(), val);
-            } else if (Arg->getType()->isFloatingType()) {
-              double val = std::stod(SCI.value);
-              ExpectedVal = llvm::ConstantFP::get(ActualVal->getType(), val);
-            }
-            
-            if (ExpectedVal) {
-              ExpectedValues.push_back(ExpectedVal);
-            }
-          }
-        }
-
-        if (!ExpectedValues.empty()) {
-          auto createValueArray = [&](llvm::ArrayRef<llvm::Value *> Values,
-                                     const llvm::Twine &Name) -> llvm::Value * {
-            llvm::ArrayType *ArrTy = llvm::ArrayType::get(CGF.CGM.Int64Ty, Values.size());
-            llvm::AllocaInst *ArrAlloca = CGF.Builder.CreateAlloca(ArrTy, nullptr, Name);
-            llvm::Value *Zero = llvm::ConstantInt::get(CGF.IntTy, 0);
-            for (unsigned idx = 0; idx < Values.size(); ++idx) {
-              llvm::Value *CastVal = CGF.Builder.CreateIntCast(Values[idx], CGF.CGM.Int64Ty, true);
-              llvm::Value *ElemPtr = CGF.Builder.CreateInBoundsGEP(
-                  ArrTy, ArrAlloca, {Zero, llvm::ConstantInt::get(CGF.IntTy, idx)});
-              CGF.Builder.CreateDefaultAlignedStore(CastVal, ElemPtr);
-            }
-            llvm::Value *FirstElemPtr = CGF.Builder.CreateInBoundsGEP(
-                ArrTy, ArrAlloca, {Zero, Zero});
-            return CGF.Builder.CreateBitCast(FirstElemPtr, 
-                                            llvm::PointerType::getUnqual(CGF.CGM.Int64Ty));
-          };
-
-          llvm::Value *ExpectedPtr = createValueArray(ExpectedValues, "expected");
-          llvm::Value *ActualPtr = createValueArray(ActualValues, "actual");
-
-          llvm::Type *IntTy = CGF.IntTy;
-          llvm::Type *Int64PtrTy = llvm::PointerType::getUnqual(CGF.CGM.Int64Ty);
-
-          // bool check_const(int, i64*, i64*)
-          llvm::FunctionType *CheckConstTy = llvm::FunctionType::get(
-              CGF.Builder.getInt1Ty(), {IntTy, Int64PtrTy, Int64PtrTy}, false);
-          llvm::FunctionCallee CheckConstFn =
-              CGF.CGM.CreateRuntimeFunction(CheckConstTy, "check_const");
-
-          llvm::Value *NumValues = llvm::ConstantInt::get(IntTy, ExpectedValues.size());
-          llvm::CallBase *ConstCall = CGF.EmitRuntimeCallOrInvoke(
-              CheckConstFn, {NumValues, ExpectedPtr, ActualPtr});
-
-          // ConstCall == true  => values match     => use CONST kernel
-          // ConstCall == false => values mismatch  => use ORIGINAL kernel
-          constCondition = ConstCall;
-        } else {
-          constCondition = llvm::ConstantInt::getFalse(CGF.Builder.getContext());
-        }
-      } else {
-        constCondition = llvm::ConstantInt::getFalse(CGF.Builder.getContext());
-      }
-
-      CGF.Builder.CreateCondBr(constCondition, useConstBlock, useOriginalBlock);
-
-      //===------------------------------------------------------------------===//
-      // Const branch – call the specialised stub with suffix "_const".
-      //===------------------------------------------------------------------===//
-      CGF.EmitBlock(useConstBlock);
+    {
       const Expr *Callee = E->getCallee();
-      // Strip away implicit casts to get to the underlying DeclRefExpr
       const Expr *UnderlyingCallee = Callee->IgnoreParenImpCasts();
-      
       if (const DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(UnderlyingCallee)) {
         if (const FunctionDecl *CalledFD = dyn_cast<FunctionDecl>(DRE->getDecl())) {
-          std::string ConstStubName =
-              CGF.CGM.getMangledName(GlobalDecl(CalledFD)).str() + "_const";
-          if (llvm::Function *ConstStub =
-                  CGF.CGM.getModule().getFunction(ConstStubName)) {
-            CallArgList Args;
-            for (const Expr *Arg : E->arguments())
-              Args.add(CGF.EmitAnyExpr(Arg), Arg->getType());
-
+          std::string NoaliasStubName = CGF.CGM.getMangledName(GlobalDecl(CalledFD, KernelReferenceKind::Stub)).str() + "_noalias";
+          if (llvm::Function *NoaliasStub = CGF.CGM.getModule().getFunction(NoaliasStubName)) {
+            CallArgList Args; for (const Expr *Arg : E->arguments()) Args.add(CGF.EmitAnyExpr(Arg), Arg->getType());
             const CGFunctionInfo &FnInfo = CGF.CGM.getTypes().arrangeFreeFunctionCall(
                 Args, CalledFD->getType()->castAs<FunctionType>(), /*ChainCall=*/false);
-            CGF.EmitCall(FnInfo, CGCallee::forDirect(ConstStub), ReturnValueSlot(), Args);
+            CGF.EmitCall(FnInfo, CGCallee::forDirect(NoaliasStub), ReturnValueSlot(), Args);
           } else {
-            // Fallback – const stub missing.
             CGF.EmitSimpleCallExpr(E, ReturnValue, CallOrInvoke);
           }
         } else {
@@ -634,17 +643,20 @@ RValue CGCUDARuntime::EmitCUDAKernelCallExpr(CodeGenFunction &CGF,
       } else {
         CGF.EmitSimpleCallExpr(E, ReturnValue, CallOrInvoke);
       }
-      CGF.EmitBranch(afterConstCallBlock);
-
-      //===------------------------------------------------------------------===//
-      // Original branch
-      //===------------------------------------------------------------------===//
-      CGF.EmitBlock(useOriginalBlock);
-      CGF.EmitSimpleCallExpr(E, ReturnValue, CallOrInvoke);
-      CGF.EmitBranch(afterConstCallBlock);
-
-      CGF.EmitBlock(afterConstCallBlock);
     }
+    CGF.EmitBranch(afterKernelCallBlock);
+
+    // original branch
+    CGF.EmitBlock(useOriginalBlock);
+    CGF.EmitSimpleCallExpr(E, ReturnValue, CallOrInvoke);
+    CGF.EmitBranch(afterKernelCallBlock);
+
+    CGF.EmitBlock(afterKernelCallBlock);
+
+    CGF.EmitBranch(ContBlock);
+    CGF.EmitBlock(ContBlock);
+    eval.end(CGF);
+    return RValue::get(nullptr);
   } else {
     // No conditional logic needed, use original call
     CGF.EmitSimpleCallExpr(E, ReturnValue, CallOrInvoke);
@@ -657,3 +669,4 @@ RValue CGCUDARuntime::EmitCUDAKernelCallExpr(CodeGenFunction &CGF,
 
   return RValue::get(nullptr);
 }
+
