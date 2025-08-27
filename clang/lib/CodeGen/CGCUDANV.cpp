@@ -540,7 +540,7 @@ void CGNVCUDARuntime::emitDeviceStubBodyNew(CodeGenFunction &CGF,
       llvm::json::Object ArgInfo;
       ArgInfo["index"] = i;
       ArgInfo["name"] = VD->getName();
-      ArgInfo["type"] = VD->getType().getAsString();
+      ArgInfo["type"] = VD->getType().getCanonicalType().getAsString();
       ArgInfo["size"] = CGM.getContext().getTypeSize(VD->getType()) / 8;
 
       if (const auto *RD = VD->getType()->getAsRecordDecl()) {
