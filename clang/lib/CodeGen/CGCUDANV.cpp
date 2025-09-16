@@ -335,9 +335,9 @@ void CGNVCUDARuntime::emitDeviceStub(CodeGenFunction &CGF,
     }
   }
   
-  // If noalias optimization is enabled and kernel has 2+ pointer parameters,
+  // If noalias optimization is enabled
   // generate additional noalias stub
-  if (CGM.getCodeGenOpts().CudaKernelNoalias && pointerParamCount >= 2) {
+  if (CGM.getCodeGenOpts().CudaKernelNoalias) {
     emitNoaliasDeviceStub(CGF, Args);
   }
   
@@ -572,11 +572,19 @@ void CGNVCUDARuntime::emitDeviceStubBodyLegacy(CodeGenFunction &CGF,
 
 void CGNVCUDARuntime::emitNoaliasDeviceStub(CodeGenFunction &CGF,
                                             FunctionArgList &Args) {
-  // Create a new function for the noalias stub
-  std::string NoaliasStubName = CGF.CurFn->getName().str() + "_noalias";
-  llvm::FunctionType *FT = CGF.CurFn->getFunctionType();
-  llvm::Function *NoaliasStub = llvm::Function::Create(
-      FT, CGF.CurFn->getLinkage(), NoaliasStubName, CGM.getModule());
+  // Create a new function for the noalias stub, mirroring emitConstDeviceStub.
+  std::string BaseStubName = CGM.getMangledName(GlobalDecl(dyn_cast<FunctionDecl>(CGF.CurFuncDecl), KernelReferenceKind::Stub)).str();
+  std::string NoaliasStubName = BaseStubName + "_noalias";
+
+  llvm::Function *NoaliasStub = CGM.getModule().getFunction(NoaliasStubName);
+  if (!NoaliasStub) {
+    llvm::FunctionType *FT = CGF.CurFn->getFunctionType();
+    NoaliasStub = llvm::Function::Create(FT, CGF.CurFn->getLinkage(),
+                                       NoaliasStubName, CGM.getModule());
+  }
+
+  // Ensure the function is not just a declaration.
+  NoaliasStub->setLinkage(CGF.CurFn->getLinkage());
   
   // Copy attributes from original function
   NoaliasStub->copyAttributesFrom(CGF.CurFn);

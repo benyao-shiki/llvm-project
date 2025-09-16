@@ -30,11 +30,13 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Cloning.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/ErrorOr.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Analysis/CudaKernelAnalysis.h"
+#include <regex>
 #include <cstdlib>
 #include <cmath>
 #include <sys/file.h>
@@ -80,12 +82,30 @@ struct FileSharedLockGuard {
 };
 } // end anonymous namespace
 
+// Special indices for implicit CUDA parameters
+// These are chosen to be large values to avoid collision with real argument indices.
+// The values must be kept in sync with CudaKernelAnalysis.cpp
+namespace {
+static constexpr unsigned SPECIAL_INDEX_BASE = 0xE0000000;
+static constexpr unsigned GRID_DIM_X_INDEX  = SPECIAL_INDEX_BASE;
+static constexpr unsigned GRID_DIM_Y_INDEX  = SPECIAL_INDEX_BASE - 1;
+static constexpr unsigned GRID_DIM_Z_INDEX  = SPECIAL_INDEX_BASE - 2;
+static constexpr unsigned BLOCK_DIM_X_INDEX = SPECIAL_INDEX_BASE - 3;
+static constexpr unsigned BLOCK_DIM_Y_INDEX = SPECIAL_INDEX_BASE - 4;
+static constexpr unsigned BLOCK_DIM_Z_INDEX = SPECIAL_INDEX_BASE - 5;
+}
+
 using namespace llvm;
 
 #define DEBUG_TYPE "cuda-kernel-const"
 
 static cl::opt<bool> CudaConstDebug("cuda-kernel-const-debug",
     cl::desc("Enable debug prints for CudaKernelConst pass"), cl::init(false));
+
+// Forward declarations for type inference helpers
+static std::string getScalarTypeString(Type *Ty);
+static Type *findLoadTypeForArgOffset(const DataLayout &DL, Argument *Arg, uint64_t Offset);
+static Type *inferSelectedParamType(Function &F, ArrayRef<unsigned> Indices);
 
 // Optional: write selected parameters to a JSON file for host-side consumption
 static cl::opt<std::string> CudaConstSelectedOut(
@@ -271,6 +291,28 @@ bool CudaKernelConstPass::parseProfileLog() {
           }
         }
       }
+
+      // Add grid and block dimensions from profile
+      auto parseDim = [&](const char* dimName, unsigned baseIndex) {
+          if (auto DimArr = KObj->getArray(dimName)) {
+              if (DimArr->size() > 0) {
+                  if(auto V = (*DimArr)[0].getAsInteger()) LaunchArgMap[std::to_string(baseIndex) + ".0"] = std::to_string(*V);
+                  else if (auto V = (*DimArr)[0].getAsNumber()) LaunchArgMap[std::to_string(baseIndex) + ".0"] = std::to_string((long long)std::llround(*V));
+              }
+              if (DimArr->size() > 1) {
+                  if(auto V = (*DimArr)[1].getAsInteger()) LaunchArgMap[std::to_string(baseIndex - 1) + ".0"] = std::to_string(*V);
+                  else if (auto V = (*DimArr)[1].getAsNumber()) LaunchArgMap[std::to_string(baseIndex - 1) + ".0"] = std::to_string((long long)std::llround(*V));
+              }
+              if (DimArr->size() > 2) {
+                  if(auto V = (*DimArr)[2].getAsInteger()) LaunchArgMap[std::to_string(baseIndex - 2) + ".0"] = std::to_string(*V);
+                  else if (auto V = (*DimArr)[2].getAsNumber()) LaunchArgMap[std::to_string(baseIndex - 2) + ".0"] = std::to_string((long long)std::llround(*V));
+              }
+          }
+      };
+
+      parseDim("grid", GRID_DIM_X_INDEX);
+      parseDim("block", BLOCK_DIM_X_INDEX);
+
       if (!LaunchArgMap.empty())
         KP.launches.push_back(std::move(LaunchArgMap));
     }
@@ -403,9 +445,9 @@ void CudaKernelConstPass::computeBestSelections(Module &M, ModuleAnalysisManager
       if (Weight <= 0)
         continue;
       unsigned ArgIndex = PI.getArgIndex();
-      std::string Path = std::to_string((int)PI.Indices[0]);
+      std::string Path = std::to_string(PI.Indices[0]);
       for (size_t ii = 1; ii < PI.Indices.size(); ++ii)
-        Path += "." + std::to_string((int)PI.Indices[ii]);
+        Path += "." + std::to_string(PI.Indices[ii]);
       Candidates.push_back({ArgIndex, PI.Indices, std::move(Path), static_cast<double>(Weight)});
     }
 
@@ -552,6 +594,13 @@ void CudaKernelConstPass::computeBestSelections(Module &M, ModuleAnalysisManager
       SP.Indices.assign(BestSubIndicesPathVec[i].begin(), BestSubIndicesPathVec[i].end());
       SP.Value = BestValues[i];
       SP.Ratio = S.ratio;
+      if (!SP.Indices.empty() && SP.Indices[0] >= SPECIAL_INDEX_BASE - 5) {
+        SP.Type = "i32";
+      } else if (Type *SelTy = inferSelectedParamType(F, SP.Indices)) {
+        SP.Type = getScalarTypeString(SelTy);
+      } else {
+        SP.Type = "unknown";
+      }
       SelectedParams.push_back(std::move(SP));
     }
 
@@ -604,6 +653,67 @@ Value *CudaKernelConstPass::getConstantValue(const std::string &valueStr, Type *
   return nullptr;
 }
 
+// Helper: stringify scalar type
+static std::string getScalarTypeString(Type *Ty) {
+  if (!Ty) return "unknown";
+  if (Ty->isIntegerTy()) return ("i" + Twine(Ty->getIntegerBitWidth())).str();
+  if (Ty->isHalfTy()) return "half";
+  if (Ty->isBFloatTy()) return "bfloat16";
+  if (Ty->isFloatTy()) return "float";
+  if (Ty->isDoubleTy()) return "double";
+  if (Ty->isFP128Ty()) return "fp128";
+  if (Ty->isPointerTy()) return "pointer";
+  return "unknown";
+}
+
+// Helper: find a load type from uses of an argument at a concrete byte offset
+static Type *findLoadTypeForArgOffset(const DataLayout &DL, Argument *Arg, uint64_t Offset) {
+  if (!Arg) return nullptr;
+  for (User *U : Arg->users()) {
+    if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
+      APInt GEP_Offset(DL.getPointerSizeInBits(GEP->getPointerAddressSpace()), 0);
+      if (!GEP->accumulateConstantOffset(DL, GEP_Offset)) continue;
+      if (GEP_Offset.getZExtValue() != Offset) continue;
+      SmallVector<Value *, 8> Worklist;
+      SmallPtrSet<Value *, 8> Visited;
+      Worklist.push_back(GEP);
+      while (!Worklist.empty()) {
+        Value *V = Worklist.pop_back_val();
+        if (!Visited.insert(V).second) continue;
+        for (User *GU : V->users()) {
+          if (auto *BC = dyn_cast<BitCastInst>(GU)) { Worklist.push_back(BC); continue; }
+          if (auto *LI = dyn_cast<LoadInst>(GU)) { return LI->getType(); }
+        }
+      }
+    }
+  }
+  // Fallback: if Arg itself is scalar and offset is zero
+  if (Offset == 0 && Arg->getType()->isSingleValueType()) return Arg->getType();
+  return nullptr;
+}
+
+// Helper: infer selected parameter type based on indices path [ArgIndex(,Offset)]
+static Type *inferSelectedParamType(Function &F, ArrayRef<unsigned> Indices) {
+  if (Indices.empty()) return nullptr;
+  unsigned ArgIndex = Indices[0];
+
+  // Handle special indices for grid/block dimensions
+  if (ArgIndex >= SPECIAL_INDEX_BASE) {
+      // These are always i32
+      return Type::getInt32Ty(F.getContext());
+  }
+
+  uint64_t Offset = 0;
+  if (Indices.size() >= 2) Offset = Indices[1];
+  if (ArgIndex >= F.arg_size()) return nullptr;
+  Argument *Arg = F.getArg(ArgIndex);
+  const DataLayout &DL = F.getParent()->getDataLayout();
+  // If offset==0 and argument is a scalar, return it directly
+  if (Offset == 0 && (Arg->getType()->isIntegerTy() || Arg->getType()->isFloatingPointTy()))
+    return Arg->getType();
+  // Otherwise, attempt to find a load type at the offset
+  return findLoadTypeForArgOffset(DL, Arg, Offset);
+}
 // Replace all uses of a parameter with a constant value
 void CudaKernelConstPass::replaceUsesWithConstant(Function &F, unsigned paramIndex, 
                                                   Value *constantValue) {
@@ -618,6 +728,7 @@ void CudaKernelConstPass::performConstantPropagation(Function &F,
                                                      const KernelConstProfile &Profile,
                                                      ArrayRef<SelectedParamRecord> SPs) {
   const DataLayout &DL = F.getParent()->getDataLayout();
+  Module *M = F.getParent();
 
   for (const SelectedParamRecord &SP : SPs) {
     // Normalize indices: accept [arg] as [arg,0]
@@ -630,6 +741,42 @@ void CudaKernelConstPass::performConstantPropagation(Function &F,
     } else {
       ArgIndex = SP.Indices[0];
       Offset = SP.Indices[1];
+    }
+
+    // Handle special grid/block dim parameters
+    if (ArgIndex >= SPECIAL_INDEX_BASE - 5) {
+      Type *Ty = Type::getInt32Ty(F.getContext());
+      Value *ConstVal = getConstantValue(SP.Value, Ty);
+      if (!ConstVal) continue;
+
+      StringRef IntrinsicName;
+      switch (ArgIndex) {
+        case GRID_DIM_X_INDEX: IntrinsicName = "llvm.nvvm.read.ptx.sreg.nctaid.x"; break;
+        case GRID_DIM_Y_INDEX: IntrinsicName = "llvm.nvvm.read.ptx.sreg.nctaid.y"; break;
+        case GRID_DIM_Z_INDEX: IntrinsicName = "llvm.nvvm.read.ptx.sreg.nctaid.z"; break;
+        case BLOCK_DIM_X_INDEX: IntrinsicName = "llvm.nvvm.read.ptx.sreg.ntid.x"; break;
+        case BLOCK_DIM_Y_INDEX: IntrinsicName = "llvm.nvvm.read.ptx.sreg.ntid.y"; break;
+        case BLOCK_DIM_Z_INDEX: IntrinsicName = "llvm.nvvm.read.ptx.sreg.ntid.z"; break;
+      }
+
+      if (!IntrinsicName.empty()) {
+        Function *Intrinsic = M->getFunction(IntrinsicName);
+        if (Intrinsic) {
+          SmallVector<Instruction*, 8> ToErase;
+          for (Instruction &I : instructions(F)) {
+            if (auto *CI = dyn_cast<CallInst>(&I)) {
+              if (CI->getCalledFunction() == Intrinsic) {
+                CI->replaceAllUsesWith(ConstVal);
+                ToErase.push_back(CI);
+              }
+            }
+          }
+          for (Instruction *I : ToErase) {
+            I->eraseFromParent();
+          }
+        }
+      }
+      continue;
     }
  
     if (ArgIndex >= F.arg_size()) continue;
@@ -789,7 +936,7 @@ PreservedAnalyses CudaKernelConstPass::run(Module &M, ModuleAnalysisManager &AM)
 // Optionally dump selections to JSON for host-side
 static void dumpSelectionsToJson(const std::map<std::string, std::vector<SelectedParamRecord>> &Selected,
                                  const std::string &OutPath) {
-  if (OutPath.empty() || Selected.empty()) return;
+  if (OutPath.empty()) return;
 
   FileLockGuard Lock(OutPath);
   if (!Lock.acquired()) {
@@ -814,6 +961,7 @@ static void dumpSelectionsToJson(const std::map<std::string, std::vector<Selecte
                 }
                 if (auto S = O->getString("value")) SP.Value = S->str();
                 if (auto R = O->getNumber("ratio")) SP.Ratio = *R;
+                if (auto T = O->getString("type")) SP.Type = T->str();
                 if (!SP.Indices.empty()) Existing[KName].push_back(std::move(SP));
               }
             }
@@ -832,6 +980,7 @@ static void dumpSelectionsToJson(const std::map<std::string, std::vector<Selecte
                 }
                 if (auto S = O->getString("value")) SP.Value = S->str();
                 if (auto R = O->getNumber("ratio")) SP.Ratio = *R;
+                if (auto T = O->getString("type")) SP.Type = T->str();
                 if (!SP.Indices.empty()) Existing[KName].push_back(std::move(SP));
               }
             }
@@ -852,7 +1001,7 @@ static void dumpSelectionsToJson(const std::map<std::string, std::vector<Selecte
     for (const auto &SP : Vec) {
       bool Replaced = false;
       for (auto &Old : Dst) {
-        if (indicesEqual(Old.Indices, SP.Indices)) { Old.Value = SP.Value; Old.Ratio = SP.Ratio; Replaced = true; break; }
+        if (indicesEqual(Old.Indices, SP.Indices)) { Old.Value = SP.Value; Old.Ratio = SP.Ratio; if (!SP.Type.empty()) Old.Type = SP.Type; Replaced = true; break; }
       }
       if (!Replaced) Dst.push_back(SP);
     }
@@ -867,7 +1016,7 @@ static void dumpSelectionsToJson(const std::map<std::string, std::vector<Selecte
     for (const auto &SP : Params) {
       llvm::json::Object Item; llvm::json::Array Idxs;
       for (unsigned idx : SP.Indices) Idxs.push_back((int64_t)idx);
-      Item["indices"] = std::move(Idxs); Item["value"] = SP.Value; Item["ratio"] = SP.Ratio; Items.push_back(std::move(Item));
+      Item["indices"] = std::move(Idxs); Item["value"] = SP.Value; Item["ratio"] = SP.Ratio; Item["type"] = (SP.Type.empty() ? std::string("unknown") : SP.Type); Items.push_back(std::move(Item));
     }
     KObj["selected"] = std::move(Items); Kernels.push_back(std::move(KObj));
   }
@@ -908,6 +1057,7 @@ static void mergeSelectionsIntoProfile(const std::map<std::string, std::vector<S
                 }
                 if (auto S = O->getString("value")) SP.Value = S->str();
                 if (auto R = O->getNumber("ratio")) SP.Ratio = *R; // optional
+                if (auto T = O->getString("type")) SP.Type = T->str();
                 if (!SP.Indices.empty()) Existing[KName].push_back(std::move(SP));
               }
             }
@@ -924,6 +1074,7 @@ static void mergeSelectionsIntoProfile(const std::map<std::string, std::vector<S
                 }
                 if (auto S = O->getString("value")) SP.Value = S->str();
                 if (auto R = O->getNumber("ratio")) SP.Ratio = *R;
+                if (auto T = O->getString("type")) SP.Type = T->str();
                 if (!SP.Indices.empty()) Existing[KName].push_back(std::move(SP));
               }
             }
@@ -941,7 +1092,7 @@ static void mergeSelectionsIntoProfile(const std::map<std::string, std::vector<S
   for (const auto &KV : Selected) {
     auto &Dst = Existing[KV.first];
     for (const auto &SP : KV.second) {
-      bool Replaced = false; for (auto &Old : Dst) { if (indicesEqual(Old.Indices, SP.Indices)) { Old.Value = SP.Value; Old.Ratio = SP.Ratio; Replaced = true; break; } }
+      bool Replaced = false; for (auto &Old : Dst) { if (indicesEqual(Old.Indices, SP.Indices)) { Old.Value = SP.Value; Old.Ratio = SP.Ratio; if (!SP.Type.empty()) Old.Type = SP.Type; Replaced = true; break; } }
       if (!Replaced) Dst.push_back(SP);
     }
   }
@@ -951,7 +1102,7 @@ static void mergeSelectionsIntoProfile(const std::map<std::string, std::vector<S
   for (const auto &KV : Existing) {
     llvm::json::Object KObj; KObj["name"] = KV.first; llvm::json::Array Items;
     for (const auto &SP : KV.second) { llvm::json::Object Item; llvm::json::Array Idxs; for (unsigned idx : SP.Indices) Idxs.push_back((int64_t)idx);
-      Item["indices"] = std::move(Idxs); Item["value"] = SP.Value; Item["ratio"] = SP.Ratio; Items.push_back(std::move(Item)); }
+      Item["indices"] = std::move(Idxs); Item["value"] = SP.Value; Item["ratio"] = SP.Ratio; Item["type"] = (SP.Type.empty() ? std::string("unknown") : SP.Type); Items.push_back(std::move(Item)); }
     KObj["selected"] = std::move(Items); Kernels.push_back(std::move(KObj));
   }
   Root["cuda_const_selected"] = std::move(Kernels);

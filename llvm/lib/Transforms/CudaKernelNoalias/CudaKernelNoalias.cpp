@@ -18,11 +18,20 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/Intrinsics.h"
+#include "llvm/IR/MDBuilder.h"
 #include "llvm/IR/CallingConv.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalValue.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/Intrinsics.h"
+#include "llvm/IR/MDBuilder.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
@@ -411,7 +420,7 @@ void CudaKernelNoaliasPass::computeBestSelections(Module &M, ModuleAnalysisManag
 }
 
 // Dump selections to JSON file (array form), or merge into profile if no out given
-static void dumpSelectionsToJson(const std::map<std::string, std::vector<SelectedNoaliasItem>> &Selected,
+static void dumpSelectionsToJson(const std::map<std::string, std::vector<SelectedNoaliasItem>> &Selected, 
                                  const std::string &OutPath) {
   if (OutPath.empty() || Selected.empty()) return;
 
@@ -462,7 +471,7 @@ static void dumpSelectionsToJson(const std::map<std::string, std::vector<Selecte
   for (const auto &KV : Selected) {
     auto &Dst = Existing[KV.first];
     for (const auto &It : KV.second) {
-      bool Replaced = false; for (auto &Old : Dst) { if (indicesEqual(Old.Indices, It.Indices)) { Old.Ratio = It.Ratio; Replaced = true; break; } }
+      bool Replaced = false; for (auto &Old : Dst) { if (indicesEqual(Old.Indices, It.Indices)) { Old.Ratio = It.Ratio; Replaced = true; break; } } 
       if (!Replaced) Dst.push_back(It);
     }
   }
@@ -531,7 +540,7 @@ static void mergeSelectionsIntoProfile(const std::map<std::string, std::vector<S
   for (const auto &KV : Selected) {
     auto &Dst = Existing[KV.first];
     for (const auto &It : KV.second) {
-      bool Replaced = false; for (auto &Old : Dst) { if (indicesEqual(Old.Indices, It.Indices)) { Old.Ratio = It.Ratio; Replaced = true; break; } }
+      bool Replaced = false; for (auto &Old : Dst) { if (indicesEqual(Old.Indices, It.Indices)) { Old.Ratio = It.Ratio; Replaced = true; break; } } 
       if (!Replaced) Dst.push_back(It);
     }
   }
@@ -552,16 +561,153 @@ static void mergeSelectionsIntoProfile(const std::map<std::string, std::vector<S
   OS << formatv("{0:2}\n", json::Value(std::move(Root)));
 }
 
-// Clone kernel with noalias attributes on selected TOP-LEVEL parameters
-static Function *cloneKernelWithNoalias(Function &OrigF,
+// Helper to find all memory accesses (loads/stores) from a given pointer value.
+// This function traverses through GEPs and bitcasts.
+static void findMemoryAccesses(Value *Ptr, SmallVectorImpl<Instruction *> &Accesses) {
+    SmallVector<Value *, 16> Worklist;
+    Worklist.push_back(Ptr);
+    SmallPtrSet<Value *, 16> Visited;
+
+    while (!Worklist.empty()) {
+        Value *V = Worklist.pop_back_val();
+        if (!Visited.insert(V).second) continue;
+
+        for (User *U : V->users()) {
+            if (auto *I = dyn_cast<Instruction>(U)) {
+                if (isa<LoadInst>(I) || isa<StoreInst>(I)) {
+                    Accesses.push_back(I);
+                } else if (isa<GetElementPtrInst>(I) || isa<BitCastInst>(I)) {
+                    Worklist.push_back(I);
+                } else if (isa<CallInst>(I) || isa<CallBrInst>(I)) {
+                    // TODO: Also consider calls/invokes as potential memory accesses if they use the pointer. Such as
+                    // inline ptx for memory access, now just add the call inst into Accesses.
+                    Accesses.push_back(I);
+                }
+            }
+        }
+    }
+}
+
+// Apply noalias metadata to selected pointers (top-level or nested)
+// TODO: this func now only performe ptr(from cuda kernel analysis pass) noalias with all the other ptrs from cuda 
+// kernel analysis pass, but idealy it should consider all ptrs and their memory accesses in the kernel. 
+static void performNoaliasTransformation(Function &F,
+                                         const std::vector<SelectedNoaliasItem> &Items) {
+  const DataLayout &DL = F.getParent()->getDataLayout();
+  LLVMContext &Ctx = F.getContext();
+
+  // Collect all nested pointer values that need to be wrapped with metadata.
+  SmallVector<Value*, 16> PointersToWrap;
+  for (const auto &Item : Items) {
+    // Only process struct members (path size >= 2). Top-level pointers are
+    // handled with parameter attributes.
+    if (Item.Indices.size() < 2) continue;
+
+    unsigned ArgIndex = Item.Indices[0];
+    if (ArgIndex >= F.arg_size()) continue;
+    Argument *Arg = F.getArg(ArgIndex);
+    uint64_t Offset = Item.Indices[1];
+
+    // This logic handles the first member (offset 0) and subsequent members.
+    bool FoundAtOffset0 = false;
+    if (Offset == 0) {
+        for (User *U : Arg->users()) {
+            if (auto *LI = dyn_cast<LoadInst>(U)) {
+                if (LI->getType()->isPointerTy()) {
+                    PointersToWrap.push_back(LI);
+                    FoundAtOffset0 = true;
+                }
+            }
+        }
+    }
+    if (FoundAtOffset0) continue;
+
+    for (User *U : Arg->users()) {
+      if (auto *GEP = dyn_cast<GetElementPtrInst>(U)) {
+        APInt GEP_Offset(DL.getPointerSizeInBits(GEP->getPointerAddressSpace()), 0);
+        if (GEP->accumulateConstantOffset(DL, GEP_Offset)) {
+          if (GEP_Offset.getZExtValue() == Offset) {
+            SmallVector<Value *, 4> Worklist;
+            Worklist.push_back(GEP);
+            SmallPtrSet<Value *, 4> Visited;
+            while (!Worklist.empty()) {
+              Value *V = Worklist.pop_back_val();
+              if (!Visited.insert(V).second) continue;
+              for (User *GEPUser : V->users()) {
+                if (isa<BitCastInst>(GEPUser)) {
+                  Worklist.push_back(GEPUser);
+                } else if (auto *LI = dyn_cast<LoadInst>(GEPUser)) {
+                  if (LI->getType()->isPointerTy()) PointersToWrap.push_back(LI);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (PointersToWrap.size() < 2) return;
+
+  MDBuilder MDB(Ctx);
+  MDNode *Domain = MDB.createAnonymousAliasScopeDomain("cuda.noalias.domain");
+
+  // Create a stable mapping from each pointer to a unique scope.
+  DenseMap<Value*, Metadata*> PtrToScopeMap;
+  for (Value *PtrVal : PointersToWrap) {
+      std::string Name = "scope.";
+      if (PtrVal->hasName()) {
+          Name += PtrVal->getName().str();
+      } else {
+          Name += std::to_string(reinterpret_cast<uintptr_t>(PtrVal));
+      }
+      PtrToScopeMap[PtrVal] = MDB.createAnonymousAliasScope(Domain, Name);
+  }
+
+  // For each pointer, find its memory accesses and tag them.
+  for (Value *PtrVal : PointersToWrap) {
+    SmallVector<Instruction*, 16> Accesses;
+    findMemoryAccesses(PtrVal, Accesses);
+
+    Metadata *ThisScope = PtrToScopeMap[PtrVal];
+
+    SmallVector<Metadata*, 16> NoAliasList;
+    for (auto const& [OtherPtr, OtherScope] : PtrToScopeMap) {
+        if (PtrVal == OtherPtr) continue;
+        NoAliasList.push_back(OtherScope);
+    }
+    if (NoAliasList.empty()) continue;
+
+    MDNode* ScopeMD = MDNode::get(Ctx, {ThisScope});
+    MDNode* NoAliasMD = MDNode::get(Ctx, NoAliasList);
+
+    for (Instruction* Inst : Accesses) {
+      // FIXME: If the instruction is a call inst such as inline ptx, is there way to add the scope metadata to the 
+      // real memory access? for now just add the scope metadata to the call inst.
+        Inst->setMetadata(LLVMContext::MD_alias_scope, ScopeMD);
+        Inst->setMetadata(LLVMContext::MD_noalias, NoAliasMD);
+    }
+  }
+}
+
+// Clone kernel and apply noalias transformation
+static Function *cloneAndApplyNoalias(Function &OrigF,
                                         const std::vector<SelectedNoaliasItem> &Items) {
   ValueToValueMapTy VMap; Function *ClonedF = CloneFunction(&OrigF, VMap);
   std::string NewName = OrigF.getName().str() + "_noalias"; ClonedF->setName(NewName);
 
-  // Collect unique top-level arg indices
-  SmallSet<unsigned, 8> Top;
-  for (const auto &It : Items) if (!It.Indices.empty()) Top.insert(It.Indices.front());
-  for (unsigned Idx : Top) if (Idx < ClonedF->arg_size()) ClonedF->addParamAttr(Idx, Attribute::NoAlias);
+  // Apply noalias transformation using metadata for nested pointers.
+  performNoaliasTransformation(*ClonedF, Items);
+
+  // Apply noalias attribute to selected top-level pointer arguments.
+  for (const auto &Item : Items) {
+      if (Item.Indices.size() == 1) {
+          unsigned ArgIndex = Item.Indices[0];
+          if (ArgIndex < ClonedF->arg_size() && ClonedF->getArg(ArgIndex)->getType()->isPointerTy()) {
+              ClonedF->addParamAttr(ArgIndex, Attribute::NoAlias);
+          }
+      }
+  }
 
   // Copy nvvm.annotations kernel tag
   Module *M = OrigF.getParent(); NamedMDNode *NMD = M->getOrInsertNamedMetadata("nvvm.annotations");
@@ -600,7 +746,7 @@ PreservedAnalyses CudaKernelNoaliasPass::run(Module &M, ModuleAnalysisManager &A
     auto It = SelectedByKernel.find(F->getName().str());
     if (It == SelectedByKernel.end() || It->second.empty()) continue;
 
-    Function *Clone = cloneKernelWithNoalias(*F, It->second);
+    Function *Clone = cloneAndApplyNoalias(*F, It->second);
     (void)Clone; Changed = true;
     LLVM_DEBUG(dbgs() << "Cloned kernel " << F->getName() << " to " << Clone->getName()
                       << " with noalias on " << It->second.size() << " selected entries\n");

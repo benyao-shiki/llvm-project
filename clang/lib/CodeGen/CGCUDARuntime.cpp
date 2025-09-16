@@ -64,11 +64,22 @@ struct ScalarConstInfo {
   std::string value;  // Common constant value as string
   double ratio;       // Frequency ratio (0.0 to 1.0)
   std::vector<unsigned> indices; // Full indices path (e.g., [arg, member...])
+  std::string type;
 };
 
 struct KernelConstProfileInfo {
   std::vector<ScalarConstInfo> commonScalars;
 };
+
+// Special indices for implicit CUDA parameters
+// These must be kept in sync with the LLVM pass CudaKernelConst.cpp
+static constexpr unsigned SPECIAL_INDEX_BASE = 0xE0000000;
+static constexpr unsigned GRID_DIM_X_INDEX  = SPECIAL_INDEX_BASE;
+static constexpr unsigned GRID_DIM_Y_INDEX  = SPECIAL_INDEX_BASE - 1;
+static constexpr unsigned GRID_DIM_Z_INDEX  = SPECIAL_INDEX_BASE - 2;
+static constexpr unsigned BLOCK_DIM_X_INDEX = SPECIAL_INDEX_BASE - 3;
+static constexpr unsigned BLOCK_DIM_Y_INDEX = SPECIAL_INDEX_BASE - 4;
+static constexpr unsigned BLOCK_DIM_Z_INDEX = SPECIAL_INDEX_BASE - 5;
 
 static llvm::StringMap<KernelProfileInfo> KernelProfileMap;
 static llvm::StringMap<KernelConstProfileInfo> KernelConstProfileMap;
@@ -119,13 +130,14 @@ static void loadCudaKernelProfile(const CodeGenModule &CGM) {
 
   // 0) Prefer cuda_const_selected if present; it contains final device-side selections.
   {
-    auto addConstItem = [&](llvm::StringRef Kernel, std::vector<unsigned> Indices, std::string ValueStr) {
+    auto addConstItem = [&](llvm::StringRef Kernel, std::vector<unsigned> Indices, std::string ValueStr, std::string TypeStr = "") {
       KernelConstProfileInfo &Slot = KernelConstProfileMap[Kernel];
       ScalarConstInfo Item;
       Item.index = Indices.empty() ? 0u : Indices.front();
       Item.value = std::move(ValueStr);
       Item.ratio = 1.0; // final selection – treat as always-on
       Item.indices = std::move(Indices);
+      Item.type = std::move(TypeStr);
       Slot.commonScalars.push_back(std::move(Item));
     };
 
@@ -148,8 +160,8 @@ static void loadCudaKernelProfile(const CodeGenModule &CGM) {
               } else {
                 continue;
               }
- 
               std::string ValueStr;
+ 
               if (auto S = O->getString("value")) {
                 ValueStr = S->str();
               } else if (auto N = O->get("value")) {
@@ -160,7 +172,11 @@ static void loadCudaKernelProfile(const CodeGenModule &CGM) {
               } else {
                 continue;
               }
-              addConstItem(KernelName, std::move(IndicesVec), std::move(ValueStr));
+              std::string TypeStr;
+              if (auto T = O->getString("type")) {
+                TypeStr = T->str();
+              }
+              addConstItem(KernelName, std::move(IndicesVec), std::move(ValueStr), std::move(TypeStr));
             }
           }
         }
@@ -202,7 +218,11 @@ static void loadCudaKernelProfile(const CodeGenModule &CGM) {
                 } else {
                   continue;
                 }
-                addConstItem(KName, std::move(IndicesVec), std::move(ValueStr));
+                std::string TypeStr;
+                if (auto T = O->getString("type")) {
+                  TypeStr = T->str();
+                }
+                addConstItem(KName, std::move(IndicesVec), std::move(ValueStr), std::move(TypeStr));
               }
             }
           }
@@ -374,35 +394,115 @@ RValue CGCUDARuntime::EmitCUDAKernelCallExpr(CodeGenFunction &CGF,
            if (Path.empty()) continue;
  
            unsigned ArgIndex = Path[0];
-           if (ArgIndex >= E->getNumArgs()) continue;
-           const Expr *ArgE = E->getArg(ArgIndex);
- 
            llvm::Value *ActualVal = nullptr;
-           if (Path.size() == 1 || (Path.size() == 2 && Path[1] == 0)) {
-             // This is a top-level scalar argument.
-             ActualVal = CGF.EmitAnyExpr(ArgE).getScalarVal();
-           } else if (Path.size() == 2) {
-             // This is a struct member, identified by byte offset.
-             uint64_t Offset = Path[1];
-             LValue BaseLV = CGF.EmitLValue(ArgE);
-             llvm::Value *BasePtr = BaseLV.getPointer(CGF);
-             llvm::Value *OffsetVal = llvm::ConstantInt::get(CGF.SizeTy, Offset);
 
-             // GEP on the i8* pointer
-             llvm::Value *GEPPtr = CGF.Builder.CreateInBoundsGEP(
-                 CGF.Builder.getInt8Ty(), BasePtr, OffsetVal);
+           if (ArgIndex >= SPECIAL_INDEX_BASE - 5) {
+             // Handle special grid/block dim parameters
+             const Expr* dimExpr = nullptr;
+             const char* fieldName = nullptr;
 
-             // We need to know the type of the member to load.
-             // This is tricky without the FieldDecl. We assume for now it's a 64-bit integer
-             // as that's what the check function expects.
-             llvm::Type *DestPtrTy = llvm::PointerType::getUnqual(CGF.Builder.getInt64Ty());
-             llvm::Value *CastedPtr = CGF.Builder.CreateBitCast(GEPPtr, DestPtrTy);
-             
-             ActualVal = CGF.Builder.CreateLoad(Address(CastedPtr, CGF.Builder.getInt64Ty(), CGF.getPointerAlign()));
+             switch (ArgIndex) {
+                 case GRID_DIM_X_INDEX:  dimExpr = E->getConfig()->getArg(0); fieldName = "x"; break;
+                 case GRID_DIM_Y_INDEX:  dimExpr = E->getConfig()->getArg(0); fieldName = "y"; break;
+                 case GRID_DIM_Z_INDEX:  dimExpr = E->getConfig()->getArg(0); fieldName = "z"; break;
+                 case BLOCK_DIM_X_INDEX: dimExpr = E->getConfig()->getArg(1); fieldName = "x"; break;
+                 case BLOCK_DIM_Y_INDEX: dimExpr = E->getConfig()->getArg(1); fieldName = "y"; break;
+                 case BLOCK_DIM_Z_INDEX: dimExpr = E->getConfig()->getArg(1); fieldName = "z"; break;
+             }
+
+             if (dimExpr && fieldName) {
+                 LValue dimLVal = CGF.EmitLValue(dimExpr);
+                 const RecordType *RT = dimLVal.getType()->getAs<RecordType>();
+                 if (RT) {
+                     const RecordDecl *RD = RT->getDecl();
+                     for (const FieldDecl *Field : RD->fields()) {
+                         if (Field->getName() == fieldName) {
+                             LValue fieldLVal = CGF.EmitLValueForField(dimLVal, Field);
+                             ActualVal = CGF.EmitLoadOfScalar(fieldLVal.getAddress(), false, Field->getType(), E->getExprLoc());
+                             break;
+                         }
+                     }
+                 }
+             }
+           } else {
+             if (ArgIndex >= E->getNumArgs()) continue;
+             const Expr *ArgE = E->getArg(ArgIndex);
+ 
+             if (Path.size() == 1 || (Path.size() == 2 && Path[1] == 0)) {
+               // This is a top-level scalar argument.
+               ActualVal = CGF.EmitAnyExpr(ArgE).getScalarVal();
+             } else if (Path.size() == 2) {
+               // This is a struct member, identified by byte offset.
+               uint64_t Offset = Path[1];
+               LValue BaseLV = CGF.EmitLValue(ArgE);
+               llvm::Value *BasePtr = BaseLV.getPointer(CGF);
+               llvm::Value *OffsetVal = llvm::ConstantInt::get(CGF.SizeTy, Offset);
+
+               // GEP on the i8* pointer
+               llvm::Value *GEPPtr = CGF.Builder.CreateInBoundsGEP(
+                   CGF.Builder.getInt8Ty(), BasePtr, OffsetVal);
+
+               // Load the value based on the type string from the profile.
+               const std::string &TypeStr = SCI.type;
+               llvm::Type *LoadTy = nullptr;
+               unsigned AlignInBytes = 0;
+ 
+               if (TypeStr == "long" || TypeStr == "long long" || TypeStr == "unsigned long" || TypeStr == "unsigned long long" || TypeStr == "i64" || TypeStr == "u64") {
+                   LoadTy = CGF.Builder.getInt64Ty();
+                   AlignInBytes = 8;
+               } else if (TypeStr == "int" || TypeStr == "unsigned int" || TypeStr == "i32" || TypeStr == "u32") {
+                   LoadTy = CGF.Builder.getInt32Ty();
+                   AlignInBytes = 4;
+               } else if (TypeStr == "short" || TypeStr == "unsigned short" || TypeStr == "i16" || TypeStr == "u16") {
+                   LoadTy = CGF.Builder.getInt16Ty();
+                   AlignInBytes = 2;
+               } else if (TypeStr == "char" || TypeStr == "unsigned char" || TypeStr == "signed char" || TypeStr == "i8" || TypeStr == "u8") {
+                   LoadTy = CGF.Builder.getInt8Ty();
+                   AlignInBytes = 1;
+               } else if (TypeStr == "float") {
+                   LoadTy = CGF.Builder.getFloatTy();
+                   AlignInBytes = 4;
+               } else if (TypeStr == "double") {
+                   LoadTy = CGF.Builder.getDoubleTy();
+                   AlignInBytes = 8;
+               }
+
+               if (LoadTy) {
+                   llvm::Type *DestPtrTy = LoadTy->getPointerTo();
+                   llvm::Value *CastedPtr = CGF.Builder.CreateBitCast(GEPPtr, DestPtrTy);
+                   ActualVal = CGF.Builder.CreateLoad(Address(CastedPtr, LoadTy, CharUnits::fromQuantity(AlignInBytes)));
+               } else {
+                   // Fallback: use AST layout to locate field at byte offset and load with its real type.
+                   if (const auto *RT = BaseLV.getType()->getAs<RecordType>()) {
+                     const RecordDecl *RD = RT->getDecl();
+                     const ASTContext &ASTCtx = CGF.getContext();
+                     const ASTRecordLayout &Layout = ASTCtx.getASTRecordLayout(RD);
+                     const FieldDecl *FD2 = nullptr; unsigned FieldNo2 = 0; unsigned CurNo = 0;
+                     for (const FieldDecl *Field : RD->fields()) {
+                       if (Layout.getFieldOffset(CurNo) / 8 == Offset) { FD2 = Field; FieldNo2 = CurNo; (void)FieldNo2; break; }
+                       ++CurNo;
+                     }
+                     if (FD2) {
+                       LValue MemberLV = CGF.EmitLValueForField(BaseLV, FD2);
+                       ActualVal = CGF.EmitLoadOfScalar(MemberLV.getAddress(), /*Volatile=*/false, FD2->getType(), E->getExprLoc());
+                     } else {
+                       // Last resort: old i64 fallback
+                       llvm::Type *DestPtrTy = llvm::PointerType::getUnqual(CGF.Builder.getInt64Ty());
+                       llvm::Value *CastedPtr = CGF.Builder.CreateBitCast(GEPPtr, DestPtrTy);
+                       ActualVal = CGF.Builder.CreateLoad(Address(CastedPtr, CGF.Builder.getInt64Ty(), CGF.getPointerAlign()));
+                     }
+                   } else {
+                     // Last resort: old i64 fallback
+                     llvm::Type *DestPtrTy = llvm::PointerType::getUnqual(CGF.Builder.getInt64Ty());
+                     llvm::Value *CastedPtr = CGF.Builder.CreateBitCast(GEPPtr, DestPtrTy);
+                     ActualVal = CGF.Builder.CreateLoad(Address(CastedPtr, CGF.Builder.getInt64Ty(), CGF.getPointerAlign()));
+                   }
+               }
+             }
            }
-
+ 
            if (!ActualVal) continue;
-
+ 
            // Convert to int64 for the check function
            if (ActualVal->getType()->isIntegerTy()) {
              ActualVal = CGF.Builder.CreateSExtOrTrunc(ActualVal, CGF.Builder.getInt64Ty());
@@ -441,32 +541,24 @@ RValue CGCUDARuntime::EmitCUDAKernelCallExpr(CodeGenFunction &CGF,
              std::string BaseStubName = CGF.CGM.getMangledName(GlobalDecl(CalledFD, KernelReferenceKind::Stub)).str();
              std::string ConstStubName = BaseStubName + "_const";
              
-             // Try to get or create the const stub function
+             // Try to get or declare the const stub function (as extern) even if the
+             // original stub is not present in this TU.
              llvm::Function *ConstStub = CGF.CGM.getModule().getFunction(ConstStubName);
-             
              if (!ConstStub) {
-               // Create function declaration for const stub with same signature as original
-               llvm::Function *OriginalStub = CGF.CGM.getModule().getFunction(BaseStubName);
-               
-               if (OriginalStub) {
-                 ConstStub = llvm::Function::Create(OriginalStub->getFunctionType(), 
-                                                    llvm::GlobalValue::ExternalLinkage, 
-                                                    ConstStubName, &CGF.CGM.getModule());
-               }
+               const CGFunctionInfo &FI = CGF.CGM.getTypes().arrangeGlobalDeclaration(GlobalDecl(CalledFD));
+               llvm::FunctionType *FTy = CGF.CGM.getTypes().GetFunctionType(FI);
+               ConstStub = llvm::Function::Create(FTy,
+                                                  llvm::GlobalValue::ExternalLinkage,
+                                                  ConstStubName, &CGF.CGM.getModule());
              }
              
-             if (ConstStub) {
-               CallArgList Args;
-               for (const Expr *Arg : E->arguments())
-                 Args.add(CGF.EmitAnyExpr(Arg), Arg->getType());
-               
-               const CGFunctionInfo &FnInfo = CGF.CGM.getTypes().arrangeFreeFunctionCall(
-                   Args, CalledFD->getType()->castAs<FunctionType>(), false);
-               CGF.EmitCall(FnInfo, CGCallee::forDirect(ConstStub), ReturnValueSlot(), Args);
-             } else {
-               // Fallback to original kernel
-               CGF.EmitSimpleCallExpr(E, ReturnValue, CallOrInvoke);
-             }
+             CallArgList Args;
+             for (const Expr *Arg : E->arguments())
+               Args.add(CGF.EmitAnyExpr(Arg), Arg->getType());
+             
+             const CGFunctionInfo &FnInfo = CGF.CGM.getTypes().arrangeFreeFunctionCall(
+                 Args, CalledFD->getType()->castAs<FunctionType>(), false);
+             CGF.EmitCall(FnInfo, CGCallee::forDirect(ConstStub), ReturnValueSlot(), Args);
            } else {
              CGF.EmitSimpleCallExpr(E, ReturnValue, CallOrInvoke);
            }
@@ -628,15 +720,22 @@ RValue CGCUDARuntime::EmitCUDAKernelCallExpr(CodeGenFunction &CGF,
       const Expr *UnderlyingCallee = Callee->IgnoreParenImpCasts();
       if (const DeclRefExpr *DRE = dyn_cast<DeclRefExpr>(UnderlyingCallee)) {
         if (const FunctionDecl *CalledFD = dyn_cast<FunctionDecl>(DRE->getDecl())) {
-          std::string NoaliasStubName = CGF.CGM.getMangledName(GlobalDecl(CalledFD, KernelReferenceKind::Stub)).str() + "_noalias";
-          if (llvm::Function *NoaliasStub = CGF.CGM.getModule().getFunction(NoaliasStubName)) {
-            CallArgList Args; for (const Expr *Arg : E->arguments()) Args.add(CGF.EmitAnyExpr(Arg), Arg->getType());
-            const CGFunctionInfo &FnInfo = CGF.CGM.getTypes().arrangeFreeFunctionCall(
-                Args, CalledFD->getType()->castAs<FunctionType>(), /*ChainCall=*/false);
-            CGF.EmitCall(FnInfo, CGCallee::forDirect(NoaliasStub), ReturnValueSlot(), Args);
-          } else {
-            CGF.EmitSimpleCallExpr(E, ReturnValue, CallOrInvoke);
+          std::string BaseStubName = CGF.CGM.getMangledName(GlobalDecl(CalledFD, KernelReferenceKind::Stub)).str();
+          std::string NoaliasStubName = BaseStubName + "_noalias";
+          
+          llvm::Function *NoaliasStub = CGF.CGM.getModule().getFunction(NoaliasStubName);
+          if (!NoaliasStub) {
+            const CGFunctionInfo &FI = CGF.CGM.getTypes().arrangeGlobalDeclaration(GlobalDecl(CalledFD));
+            llvm::FunctionType *FTy = CGF.CGM.getTypes().GetFunctionType(FI);
+            NoaliasStub = llvm::Function::Create(FTy,
+                                                 llvm::GlobalValue::ExternalLinkage,
+                                                 NoaliasStubName, &CGF.CGM.getModule());
           }
+          
+          CallArgList Args; for (const Expr *Arg : E->arguments()) Args.add(CGF.EmitAnyExpr(Arg), Arg->getType());
+          const CGFunctionInfo &FnInfo = CGF.CGM.getTypes().arrangeFreeFunctionCall(
+              Args, CalledFD->getType()->castAs<FunctionType>(), /*ChainCall=*/false);
+          CGF.EmitCall(FnInfo, CGCallee::forDirect(NoaliasStub), ReturnValueSlot(), Args);
         } else {
           CGF.EmitSimpleCallExpr(E, ReturnValue, CallOrInvoke);
         }

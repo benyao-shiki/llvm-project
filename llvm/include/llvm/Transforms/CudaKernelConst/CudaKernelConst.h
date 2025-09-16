@@ -35,6 +35,7 @@ struct SelectedParamRecord {
   std::vector<unsigned> Indices;
   std::string Value;
   double Ratio;
+  std::string Type;
 };
 
 // Information for a dimension that has a common value

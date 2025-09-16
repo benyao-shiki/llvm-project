@@ -10,8 +10,22 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/InstIterator.h"
 
 using namespace llvm;
+
+// Special indices for implicit CUDA parameters
+// These are chosen to be large values to avoid collision with real argument indices.
+// The values must be kept in sync with CudaKernelConst.cpp
+namespace {
+static constexpr unsigned SPECIAL_INDEX_BASE = 0xE0000000;
+static constexpr unsigned GRID_DIM_X_INDEX  = SPECIAL_INDEX_BASE;
+static constexpr unsigned GRID_DIM_Y_INDEX  = SPECIAL_INDEX_BASE - 1;
+static constexpr unsigned GRID_DIM_Z_INDEX  = SPECIAL_INDEX_BASE - 2;
+static constexpr unsigned BLOCK_DIM_X_INDEX = SPECIAL_INDEX_BASE - 3;
+static constexpr unsigned BLOCK_DIM_Y_INDEX = SPECIAL_INDEX_BASE - 4;
+static constexpr unsigned BLOCK_DIM_Z_INDEX = SPECIAL_INDEX_BASE - 5;
+}
 
 #define DEBUG_TYPE "cuda-kernel-analysis"
 
@@ -42,12 +56,31 @@ static void traversePointerMembers(const Argument &A,
   const DataLayout &DL = F.getParent()->getDataLayout();
 
   for (User *U : PtrV->users()) {
+    if (auto *LI = dyn_cast<LoadInst>(U)) {
+      if (LI->getType()->isPointerTy()) {
+        int W = analyzePointerValue(LI, F, AM);
+        if (W > 0) {
+          SmallVector<unsigned, 4> MemberPath;
+          MemberPath.push_back(A.getArgNo());
+          MemberPath.push_back(CurrentOffset); // Should be 0 for the first member
+          ParameterInfo P(A.getName().str(), &A, MemberPath);
+          auto It = PointerWeights.find(P);
+          if (It == PointerWeights.end() || It->second < W)
+            PointerWeights[P] = W;
+        }
+        traversePointerMembers(A, LI, CurrentOffset, F, AM, ScalarWeights, PointerWeights);
+      }
+      continue;
+    }
+
     auto *GEP = dyn_cast<GetElementPtrInst>(U);
     if (!GEP) continue;
 
     // We need the offset relative to the GEP's base pointer (PtrV).
     APInt RelativeOffset(DL.getPointerSizeInBits(GEP->getPointerAddressSpace()), 0);
     if (!GEP->accumulateConstantOffset(DL, RelativeOffset)) {
+      //print the non-constant GEP for debug
+      LLVM_DEBUG(dbgs() << "  GEP with non-constant offset: " << *GEP << "\n");
       continue; // Skip GEPs with non-constant offsets.
     }
 
@@ -71,16 +104,32 @@ static void traversePointerMembers(const Argument &A,
     if (Ty->isIntegerTy() || Ty->isFloatingPointTy()) {
       for (User *U2 : GEP->users()) {
         if (auto *LI = dyn_cast<LoadInst>(U2)) {
-          int W = analyzeScalarValue(LI, F, AM);
-          if (W > 0) {
-            ParameterInfo P(A.getName().str(), &A, MemberPath);
-            auto It = ScalarWeights.find(P);
-            if (It == ScalarWeights.end() || It->second < W)
-              ScalarWeights[P] = W;
-            LLVM_DEBUG({
-              dbgs() << "  Struct scalar member offset=" << TotalOffset;
-              dbgs() << ": weight = " << W << "\n";
-            });
+          if (LI->getType()->isPointerTy()) {
+            int W = analyzePointerValue(LI, F, AM);
+            if (W > 0) {
+              ParameterInfo P(A.getName().str(), &A, MemberPath);
+              auto It = PointerWeights.find(P);
+              if (It == PointerWeights.end() || It->second < W)
+                PointerWeights[P] = W;
+              LLVM_DEBUG({
+                dbgs() << "  Struct pointer member offset=" << TotalOffset;
+                dbgs() << ": weight = " << W << "\n";
+              });
+            }
+            // Recurse on the loaded pointer for pointers to structs.
+            traversePointerMembers(A, LI, TotalOffset, F, AM, ScalarWeights, PointerWeights);
+          } else {
+            int W = analyzeScalarValue(LI, F, AM);
+            if (W > 0) {
+              ParameterInfo P(A.getName().str(), &A, MemberPath);
+              auto It = ScalarWeights.find(P);
+              if (It == ScalarWeights.end() || It->second < W)
+                ScalarWeights[P] = W;
+              LLVM_DEBUG({
+                dbgs() << "  Struct scalar member offset=" << TotalOffset;
+                dbgs() << ": weight = " << W << "\n";
+              });
+            }
           }
         }
       }
@@ -102,10 +151,10 @@ static void traversePointerMembers(const Argument &A,
               dbgs() << ": weight = " << W << "\n";
             });
           }
+          // Also recurse for pointers to structs.
+          traversePointerMembers(A, LI, TotalOffset, F, AM, ScalarWeights, PointerWeights);
         }
       }
-      // Also recurse for pointers to structs.
-      traversePointerMembers(A, GEP, TotalOffset, F, AM, ScalarWeights, PointerWeights);
       continue;
     }
   }
@@ -117,7 +166,7 @@ int analyzeScalarValue(const Value *V, Function &F, FunctionAnalysisManager &AM)
     return 0;
   }
 
-  int weight = 0;
+  int weight = 1;
   auto &LI = AM.getResult<LoopAnalysis>(F);
   for (const User *U : V->users()) {
     if (const Instruction *I = dyn_cast<Instruction>(U)) {
@@ -157,11 +206,10 @@ int analyzeScalarValue(const Value *V, Function &F, FunctionAnalysisManager &AM)
 
 // Generic function to analyze pointer values (arguments or extracted values)
 int analyzePointerValue(const Value *V, Function &F, FunctionAnalysisManager &AM) {
-  if (!V->getType()->isPointerTy()) {
-    return 0;
-  }
 
-  int weight = 0;
+  //TSET
+  //for now give a initial none zero weight, to find more possible opt chance.
+  int weight = 1;
   auto &LI = AM.getResult<LoopAnalysis>(F);
   
   for (const User *U : V->users()) {
@@ -279,6 +327,8 @@ CudaKernelAnalysis::Result CudaKernelAnalysis::run(Function &F, FunctionAnalysis
                    << F.getName() << "'\n");
 
   unsigned ArgIndex = 0;
+  // TODO: for now only analyze the argument from the function signature, 
+  // but we should also analyze hiding scalar like the grid and block dims, and shared memory size maybe.
   for (const Argument &A : F.args()) {
     if (A.hasByValAttr()) {
       // By-value struct arguments are pointers, but we analyze their members.
@@ -312,6 +362,59 @@ CudaKernelAnalysis::Result CudaKernelAnalysis::run(Function &F, FunctionAnalysis
                        << " members\n");
     }
     ArgIndex++;
+  }
+
+  // Analyze uses of special CUDA variables (blockDim, gridDim)
+  for (Instruction &I : instructions(F)) {
+    if (auto *CI = dyn_cast<CallInst>(&I)) {
+      Function *CalledF = CI->getCalledFunction();
+      if (CalledF) {
+        LLVM_DEBUG(dbgs() << "[CudaKernelAnalysis] Analyzing call: " << CalledF->getName() << "\n");
+        StringRef Name = CalledF->getName();
+        unsigned SpecialIndex = 0;
+        const char* SpecialName = nullptr;
+
+        if (Name == "llvm.nvvm.read.ptx.sreg.nctaid.x") {
+          SpecialIndex = GRID_DIM_X_INDEX;
+          SpecialName = "gridDim.x";
+        } else if (Name == "llvm.nvvm.read.ptx.sreg.nctaid.y") {
+          SpecialIndex = GRID_DIM_Y_INDEX;
+          SpecialName = "gridDim.y";
+        } else if (Name == "llvm.nvvm.read.ptx.sreg.nctaid.z") {
+          SpecialIndex = GRID_DIM_Z_INDEX;
+          SpecialName = "gridDim.z";
+        } else if (Name == "llvm.nvvm.read.ptx.sreg.ntid.x") {
+          SpecialIndex = BLOCK_DIM_X_INDEX;
+          SpecialName = "blockDim.x";
+        } else if (Name == "llvm.nvvm.read.ptx.sreg.ntid.y") {
+          SpecialIndex = BLOCK_DIM_Y_INDEX;
+          SpecialName = "blockDim.y";
+        } else if (Name == "llvm.nvvm.read.ptx.sreg.ntid.z") {
+          SpecialIndex = BLOCK_DIM_Z_INDEX;
+          SpecialName = "blockDim.z";
+        }
+
+        if (SpecialIndex != 0) {
+          int weight = analyzeScalarValue(CI, F, AM);
+          LLVM_DEBUG(dbgs() << "[CudaKernelAnalysis] Found special intrinsic '" << Name
+                            << "' with calculated weight " << weight << "\n");
+          if (weight > 0) {
+            SmallVector<unsigned, 4> Path;
+            Path.push_back(SpecialIndex);
+            Path.push_back(0);
+            // The name in ParameterInfo is mainly for debug printing.
+            // The Argument* is null, which is fine as long as we don't access it without checking.
+            ParameterInfo PI(SpecialName, nullptr, Path);
+            
+            // The same intrinsic can be called multiple times. We want to calculate
+            // the weight based on all its uses, but `analyzeScalarValue` does that
+            // for one call site. We should aggregate weights from all call sites
+            // for the same implicit parameter.
+            ScalarWeights[PI] += weight;
+          }
+        }
+      } 
+    }
   }
 
   // 汇总打印：将结构体成员并入 Scalar/Pointer 列表

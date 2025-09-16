@@ -387,18 +387,25 @@ void parse_and_add_value(json& param_info, char* data_addr) {
     } else if (type.find('*') != std::string::npos) {
         // It's a pointer
         void* ptr_value = *reinterpret_cast<void**>(data_addr);
-        char hex_buf[20];
-        sprintf(hex_buf, "%p", ptr_value);
-        param_info["value"] = hex_buf;
-
-        const MemoryRegion* region = findMemoryRegion(ptr_value);
-        if (region) {
-            param_info["size"] = region->getRemainingSize(ptr_value);
-            param_info["memory_type"] = region->type;
-            char base_addr_buf[20];
-            sprintf(base_addr_buf, "%p", region->base_addr);
-            param_info["base_address"] = base_addr_buf;
-            param_info["offset"] = region->getOffset(ptr_value);
+        // 规范化指针输出，避免"(nil)"；并标记NULL
+        unsigned long long addr_ull = (unsigned long long)reinterpret_cast<uintptr_t>(ptr_value);
+        char addr_buf[32];
+        snprintf(addr_buf, sizeof(addr_buf), "0x%llx", addr_ull);
+        param_info["value"] = addr_buf;
+        if (addr_ull == 0ULL) {
+            param_info["is_null"] = true;
+        } else {
+            const MemoryRegion* region = findMemoryRegion(ptr_value);
+            if (region) {
+                // 保留编译期的结构体成员偏移在字段 offset（若存在），不要覆盖
+                // 新增运行期分配信息字段用于别名判断
+                param_info["alloc_size"] = region->getRemainingSize(ptr_value);
+                param_info["memory_type"] = region->type;
+                char base_addr_buf[20];
+                sprintf(base_addr_buf, "%p", region->base_addr);
+                param_info["alloc_base_address"] = base_addr_buf;
+                param_info["alloc_offset"] = region->getOffset(ptr_value);
+            }
         }
     } else {
         // It's a scalar
@@ -430,53 +437,65 @@ extern "C" void __cuda_profile_kernel_launch(const char* kernel_name, const char
         }
     }
 
-    // 计算同一次launch中顶层指针参数的别名关系（区间重叠即视为别名）
+    // 计算同一次launch中所有指针（包含嵌套结构体成员）的别名关系，
+    // 使用运行期分配信息的绝对地址区间：[alloc_base_address + alloc_offset, alloc_base_address + alloc_offset + alloc_size)
     {
-        struct PtrRange { size_t idx; unsigned long long start; unsigned long long end; };
-        std::vector<PtrRange> ptrs;
+        struct P { nlohmann::json* J; unsigned long long start; unsigned long long end; };
+        std::vector<P> ptrs;
         ptrs.reserve(params_with_values.size());
 
-        for (size_t i = 0; i < params_with_values.size(); ++i) {
-            const auto& p = params_with_values[i];
-            if (!p.contains("type") || !p["type"].is_string()) continue;
-            const std::string t = p["type"].get<std::string>();
-            if (t.find('*') == std::string::npos) continue; // 仅顶层指针参数
-
-            // 需要有地址和size
-            if (!p.contains("value") || !p["value"].is_string()) continue;
-            if (!p.contains("size") || !p["size"].is_number_unsigned()) continue;
-
-            const std::string addr_str = p["value"].get<std::string>();
-            if (addr_str.rfind("0x", 0) != 0) continue;
-            unsigned long long addr = 0ULL;
-            try {
-                addr = std::stoull(addr_str, nullptr, 16);
-            } catch (...) {
-                continue;
-            }
-            unsigned long long sz = p["size"].get<unsigned long long>();
-            if (sz == 0ULL) continue;
-            ptrs.push_back(PtrRange{(size_t)i, addr, addr + sz});
-        }
-
-        // 默认alias=0，然后若检测到与任一其它指针重叠则置为1
-        for (size_t i = 0; i < params_with_values.size(); ++i) {
-            auto& p = params_with_values[i];
-            if (p.contains("type") && p["type"].is_string() && p["type"].get<std::string>().find('*') != std::string::npos) {
-                p["alias"] = 0;
-            }
-        }
-
-        for (size_t i = 0; i < ptrs.size(); ++i) {
-            for (size_t j = i + 1; j < ptrs.size(); ++j) {
-                const auto& a = ptrs[i];
-                const auto& b = ptrs[j];
-                // 区间[a.start, a.end) 与 [b.start, b.end) 是否重叠
-                if (std::max(a.start, b.start) < std::min(a.end, b.end)) {
-                    params_with_values[a.idx]["alias"] = 1;
-                    params_with_values[b.idx]["alias"] = 1;
+        std::function<void(nlohmann::json&)> collect;
+        collect = [&](nlohmann::json& node) {
+            if (node.contains("type") && node["type"].is_string()) {
+                const std::string t = node["type"].get<std::string>();
+                if (t.find('*') != std::string::npos) {
+                    bool isNull = node.value("is_null", false);
+                    // 默认 alias：NULL 指针记为 0，非 NULL 指针保守置 1
+                    if (!node.contains("alias")) node["alias"] = isNull ? 0 : 1;
+                    // 需要 alloc_base_address 与 alloc_offset 与 alloc_size（仅非 NULL 指针参与判定）
+                    if (!isNull &&
+                        node.contains("alloc_offset") && node["alloc_offset"].is_number_unsigned() &&
+                        node.contains("alloc_size") && node["alloc_size"].is_number_unsigned() &&
+                        node.contains("alloc_base_address")) {
+                        unsigned long long base = 0ULL;
+                        if (node.contains("alloc_base_address_ull") && node["alloc_base_address_ull"].is_number_unsigned()) {
+                            base = node["alloc_base_address_ull"].get<unsigned long long>();
+                        } else if (node["alloc_base_address"].is_string()) {
+                            std::string s = node["alloc_base_address"].get<std::string>();
+                            const char* c = s.c_str();
+                            if (s.rfind("0x", 0) == 0 || s.rfind("0X", 0) == 0) c += 2;
+                            char* endp = nullptr;
+                            unsigned long long v = strtoull(c, &endp, 16);
+                            if (endp && *endp == '\0') base = v;
+                        }
+                        if (base != 0ULL) {
+                            unsigned long long off = node["alloc_offset"].get<unsigned long long>();
+                            unsigned long long sz  = node["alloc_size"].get<unsigned long long>();
+                            if (sz > 0ULL) {
+                                unsigned long long start = base + off;
+                                unsigned long long end   = start + sz;
+                                ptrs.push_back(P{&node, start, end});
+                            }
+                        }
+                    }
                 }
             }
+            if (node.contains("value") && node["value"].is_array()) {
+                for (auto& c : node["value"]) collect(c);
+            }
+        };
+        for (auto& p : params_with_values) collect(p);
+
+        // 对每个指针，若与任一其它指针绝对地址区间重叠则 alias=1，否则 alias=0
+        for (size_t i = 0; i < ptrs.size(); ++i) {
+            bool overlaps = false;
+            for (size_t j = 0; j < ptrs.size(); ++j) {
+                if (i == j) continue;
+                const auto& a = ptrs[i];
+                const auto& b = ptrs[j];
+                if (std::max(a.start, b.start) < std::min(a.end, b.end)) { overlaps = true; break; }
+            }
+            (*ptrs[i].J)["alias"] = overlaps ? 1 : 0;
         }
     }
 

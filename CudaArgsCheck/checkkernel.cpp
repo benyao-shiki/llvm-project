@@ -4,6 +4,7 @@
 #include <utility>
 #include <mutex>
 #include <iostream>
+#include <iomanip>
 #include <algorithm>
 
 // Data structures to track memory allocations
@@ -179,6 +180,19 @@ bool check_ptr_sets(int num_targets, void* const* targets,
     if (n_values <= 0) return true;
     for (int i = 0; i < n_values; ++i) {
         if (expected[i] != actual[i]) {
+            std::cout << "check_const: false at index " << i << " expected: " << expected[i] << " actual: " << actual[i] << std::endl;
+
+            // --- BEGIN DEBUG PATCH ---
+            // Print the raw hex value of actual to understand its composition
+            unsigned char* p = reinterpret_cast<unsigned char*>(&actual[i]);
+            std::cout << "check_const: actual[" << i << "] raw hex (8 bytes): ";
+            for (int j = 0; j < 8; ++j) {
+                // Print as 2-digit hex
+                std::cout << std::hex << std::setw(2) << std::setfill('0') << (int)p[j] << " ";
+            }
+            std::cout << std::dec << std::endl;
+            // --- END DEBUG PATCH ---
+
             return false;
         }
     }
