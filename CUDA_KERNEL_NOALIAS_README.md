@@ -84,7 +84,9 @@ clang++ ... -mllvm -cuda-kernel-profile=/path/to/profile.json
 - 解析 `kernels[]`，通过递归地累加 `offset` 字段，将每次 launch 扁平化为“`argIndex.byteOffset` -> alias 标记”的映射；
 - 从 `CudaKernelAnalysis` 读取指针权重表，其中每个成员都由其字节偏移量唯一标识；
 - 枚举候选指针集合的所有非空子集，基于字节偏移量路径进行匹配和计分；
-- 克隆 kernel 得到 `<orig>_noalias`，仅对“顶层参数索引集合”添加 `noalias` 属性（结构体成员会归并到其顶层形参）；
+- 克隆 kernel 得到 `<orig>_noalias`。根据分析结果，采用混合策略添加 noalias 信息：
+  - **对于顶层指针参数**（分析结果中 `indices` 路径长度为 1），直接在克隆函数的对应形参上添加 `noalias` 属性。
+  - **对于结构体嵌套指针**（`indices` 路径长度 >= 2），则通过 `MDBuilder` 创建独立的别名作用域（alias scope），并为所有相关的内存访问指令（load/store）附加 `!alias.scope` 和 `!noalias` 元数据。
 - 复制 `nvvm.annotations` 的 `kernel` 标注，使克隆在设备侧可见；
 - 以 `!cuda.noalias.selected` 元数据记录结果（路径为 `[arg, offset]`），并按需写回 JSON。
 
