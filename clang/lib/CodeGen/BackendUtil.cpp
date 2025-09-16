@@ -56,7 +56,6 @@
 #include "llvm/TargetParser/SubtargetFeature.h"
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/HipStdPar/HipStdPar.h"
-#include "llvm/Transforms/CudaArgsProfile/CudaArgsProfile.h"
 #include "llvm/Transforms/IPO/EmbedBitcodePass.h"
 #include "llvm/Transforms/IPO/LowerTypeTests.h"
 #include "llvm/Transforms/IPO/ThinLTOBitcodeWriter.h"
@@ -946,13 +945,6 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
     break;
   }
 
-  // Handle CUDA args profiling option.
-  if (CodeGenOpts.CudaArgsProfile) {
-    PB.registerPipelineStartEPCallback(
-        [&](ModulePassManager &MPM, OptimizationLevel Level) {
-          MPM.addPass(CudaArgsProfilePass());
-        });
-  }
 
   // Enable verify-debuginfo-preserve-each for new PM.
   DebugifyEachInstrumentation Debugify;
