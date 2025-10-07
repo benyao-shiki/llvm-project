@@ -570,7 +570,7 @@ void CGNVCUDARuntime::emitDeviceStubBodyNew(CodeGenFunction &CGF,
         "__cuda_profile_kernel_launch");
 
     if (auto* F = dyn_cast<llvm::Function>(ProfilerFn.getCallee()))
-        F->setLinkage(llvm::GlobalValue::WeakAnyLinkage);
+        F->setLinkage(llvm::GlobalValue::ExternalWeakLinkage);
 
     llvm::Constant *KernelNameStr =
         makeConstantString(std::string(CGF.CurFn->getName()));
