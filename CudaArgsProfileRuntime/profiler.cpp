@@ -30,6 +30,15 @@ void write_profile_data() {
     const char* append_env = std::getenv("CUDA_ARGS_PROFILE_APPEND");
     bool append = (append_env && std::string(append_env) == "1");
 
+    // If we have no kernel records, skip writing to avoid overwriting
+    // an existing file with an empty structure.
+    {
+        std::lock_guard<std::mutex> lock(profile_data_mutex);
+        if (!profile_data.contains("kernels") || !profile_data["kernels"].is_array() || profile_data["kernels"].empty()) {
+            return;
+        }
+    }
+
     json final_root;
 
     int fd = open(json_path.c_str(), O_CREAT | O_RDWR, 0666);

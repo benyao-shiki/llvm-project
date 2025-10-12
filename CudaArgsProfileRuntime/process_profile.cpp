@@ -7,6 +7,10 @@
 #include <algorithm>
 #include <map>
 #include "json.hpp"
+#include <sys/file.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 using json = nlohmann::json;
 
@@ -236,20 +240,89 @@ void process_profile_data() {
     if (!json_path_env) return;
     std::string json_path = json_path_env;
 
-    std::ifstream read_file(json_path);
-    if (!read_file.is_open()) {
+    // Read with shared lock and full-string buffering for better diagnostics
+    int rfd = open(json_path.c_str(), O_RDONLY);
+    if (rfd == -1) {
         std::cerr << "Process Profile: Error opening file: " << json_path << std::endl;
         return;
     }
-
-    json root;
-    try {
-        root = json::parse(read_file);
-    } catch (json::parse_error& e) {
-        std::cerr << "Process Profile: JSON parse error: " << e.what() << std::endl;
+    if (flock(rfd, LOCK_SH) == -1) {
+        std::cerr << "Process Profile: Error locking file (shared): " << json_path << std::endl;
+        close(rfd);
         return;
     }
-    read_file.close();
+
+    std::string content;
+    {
+        char buf[1 << 16];
+        ssize_t n = 0;
+        while ((n = ::read(rfd, buf, sizeof(buf))) > 0) {
+            content.append(buf, buf + n);
+        }
+    }
+    flock(rfd, LOCK_UN);
+    close(rfd);
+
+    auto show_ctx = [&](size_t pos, size_t radius = 80) {
+        size_t b = (pos > radius ? pos - radius : 0);
+        size_t e = std::min(pos + radius, content.size());
+        std::string ctx = content.substr(b, e - b);
+        for (char &c : ctx) if (c == '\n') c = ' ';
+        return ctx;
+    };
+
+    json root;
+    bool parsed = false;
+    try {
+        root = json::parse(content);
+        parsed = true;
+    } catch (json::parse_error& e) {
+        std::cerr << "Process Profile: JSON parse error: " << e.what() << std::endl;
+        const size_t errByte = e.byte > 0 ? size_t(e.byte) - 1 : 0;
+        std::cerr << "[Profile Debug] error_byte=" << errByte
+                  << ", around=" << show_ctx(errByte) << std::endl;
+
+        // Heuristic: trim to first complete JSON document, then retry
+        bool started = false; int depth = 0; bool inStr = false; bool esc = false;
+        size_t endPos = std::string::npos;
+        for (size_t i = 0; i < content.size(); ++i) {
+            char c = content[i];
+            if (inStr) {
+                if (esc) { esc = false; continue; }
+                if (c == '\\') { esc = true; continue; }
+                if (c == '"') { inStr = false; }
+                continue;
+            }
+            if (c == '"') { inStr = true; continue; }
+            if (c == '{' || c == '[') { depth++; started = true; }
+            else if (c == '}' || c == ']') {
+                if (started) {
+                    depth--;
+                    if (depth == 0) { endPos = i + 1; break; }
+                }
+            }
+        }
+        if (endPos != std::string::npos && endPos <= content.size()) {
+            // Check extra non-whitespace after first JSON
+            std::string rest = content.substr(endPos);
+            size_t nonws = rest.find_first_not_of(" \t\r\n");
+            if (nonws != std::string::npos) {
+                std::cerr << "[Profile Debug] extra content after first JSON, starts with: "
+                          << show_ctx(endPos + nonws) << std::endl;
+            }
+            try {
+                root = json::parse(content.substr(0, endPos));
+                parsed = true;
+            } catch (json::parse_error& e2) {
+                std::cerr << "[Profile Debug] fallback parse still failed: " << e2.what() << std::endl;
+                return;
+            }
+        } else {
+            return;
+        }
+    }
+
+    if (!parsed) return;
 
     if (!root.contains("kernels") || !root["kernels"].is_array()) {
         return;
@@ -280,7 +353,31 @@ void process_profile_data() {
     new_root["hot_kernels"] = hot_kernels_vec;
     new_root["kernels"] = root["kernels"];
 
-    std::ofstream write_file(json_path, std::ios::trunc);
-    write_file << new_root.dump(2);
-    write_file.close();
+    // Atomic write: tmp file + fsync + rename
+    std::string tmp_path = json_path + ".tmp";
+    int wfd = ::open(tmp_path.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0666);
+    if (wfd == -1) {
+        std::cerr << "Process Profile: Error opening temp file for write: " << tmp_path << std::endl;
+        return;
+    }
+    std::string out = new_root.dump(2);
+    const char* p = out.data();
+    size_t left = out.size();
+    while (left > 0) {
+        ssize_t n = ::write(wfd, p, left);
+        if (n < 0) {
+            std::cerr << "Process Profile: Error writing temp file: " << tmp_path << std::endl;
+            ::close(wfd);
+            ::unlink(tmp_path.c_str());
+            return;
+        }
+        p += n; left -= size_t(n);
+    }
+    ::fsync(wfd);
+    ::close(wfd);
+    if (::rename(tmp_path.c_str(), json_path.c_str()) != 0) {
+        std::cerr << "Process Profile: Error renaming temp file to target: " << json_path << std::endl;
+        ::unlink(tmp_path.c_str());
+        return;
+    }
 }
