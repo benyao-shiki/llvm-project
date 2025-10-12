@@ -599,8 +599,28 @@ static void performNoaliasTransformation(Function &F,
   // Collect all nested pointer values that need to be wrapped with metadata.
   SmallVector<Value*, 16> PointersToWrap;
   for (const auto &Item : Items) {
-    // Only process struct members (path size >= 2). Top-level pointers are
-    // handled with parameter attributes.
+    // Skip top-level arguments
+    // Top-level pointers are handled with parameter attributes.
+    if (Item.Indices.size() == 1) continue;
+    if (Item.Indices.size() == 2 && Item.Indices[1] == 0) {
+      // Check if this is a top-level argument by checking the argument type
+      unsigned ArgIndex = Item.Indices[0];
+      if (ArgIndex < F.arg_size()) {
+        Argument *Arg = F.getArg(ArgIndex);
+        Type *ArgType = Arg->getType();
+        
+        // Check if the argument is a struct
+        // Note: With opaque pointers, we can't easily check what a pointer points to
+        // So we only check for direct struct arguments
+        bool isStruct = ArgType->isStructTy();
+        
+        if (!isStruct) {
+          // This is a top-level argument, skip it
+          continue;
+        }
+        // Otherwise, it's a struct member at offset 0, process it
+      }
+    }
     if (Item.Indices.size() < 2) continue;
 
     unsigned ArgIndex = Item.Indices[0];
@@ -701,11 +721,46 @@ static Function *cloneAndApplyNoalias(Function &OrigF,
 
   // Apply noalias attribute to selected top-level pointer arguments.
   for (const auto &Item : Items) {
+      // Check if this is a top-level argument
+      bool isTopLevel = false;
+      unsigned ArgIndex = 0;
+      
       if (Item.Indices.size() == 1) {
-          unsigned ArgIndex = Item.Indices[0];
-          if (ArgIndex < ClonedF->arg_size() && ClonedF->getArg(ArgIndex)->getType()->isPointerTy()) {
-              ClonedF->addParamAttr(ArgIndex, Attribute::NoAlias);
+          // Legacy format: single index for top-level argument
+          isTopLevel = true;
+          ArgIndex = Item.Indices[0];
+      } else if (Item.Indices.size() == 2 && Item.Indices[1] == 0) {
+          // Check if this is a top-level argument or a struct member at offset 0
+          ArgIndex = Item.Indices[0];
+          
+          if (ArgIndex < ClonedF->arg_size()) {
+              Argument *Arg = ClonedF->getArg(ArgIndex);
+              Type *ArgType = Arg->getType();
+              
+              // Check if the argument is a struct
+              // Note: With opaque pointers, we can't easily check what a pointer points to
+              // So we only check for direct struct arguments
+              bool isStruct = ArgType->isStructTy();
+              
+              if (isStruct) {
+                  // This is a struct member at offset 0, skip it for parameter attributes
+                  // (it will be handled by metadata in performNoaliasTransformation)
+                  continue;
+              } else {
+                  // This is a top-level pointer argument
+                  isTopLevel = true;
+              }
           }
+      }
+      
+      if (isTopLevel && ArgIndex < ClonedF->arg_size() && ClonedF->getArg(ArgIndex)->getType()->isPointerTy()) {
+          //dump the arg path for debug
+          dbgs() << "Adding noalias attribute to top-level arg " << ArgIndex << " with path ";
+          for (unsigned i = 0; i < Item.Indices.size(); i++) {
+              dbgs() << (i > 0 ? "." : "") << Item.Indices[i];
+          }
+          dbgs() << "\n";
+          ClonedF->addParamAttr(ArgIndex, Attribute::NoAlias);
       }
   }
 
