@@ -151,7 +151,10 @@ bool check_ptr_sets(int num_targets, void* const* targets,
             size_t b_size = oth_ranges[j].second;
             if (b_size == 0) continue;
             CUdeviceptr b1 = b0 + b_size;
-            if (a0 < b1 && b0 < a1) return true;
+            if (a0 < b1 && b0 < a1) {
+                std::cout << "check_ptr_sets: true at index " << i << " and " << j << std::endl;
+                return true;
+            }
         }
 
         for(int k = 0; k < num_targets; ++k) {
@@ -160,7 +163,10 @@ bool check_ptr_sets(int num_targets, void* const* targets,
             size_t b_size = targ_ranges[k].second;
             if (b_size == 0) continue;
             CUdeviceptr b1 = b0 + b_size;
-            if (a0 < b1 && b0 < a1) return true;
+            if (a0 < b1 && b0 < a1) {
+                std::cout << "check_ptr_sets: true at index " << i << " and " << k << std::endl;
+                return true;
+            }
         }
     }
     return false;
