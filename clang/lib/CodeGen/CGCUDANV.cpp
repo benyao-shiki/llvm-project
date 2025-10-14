@@ -596,21 +596,12 @@ void CGNVCUDARuntime::emitNoaliasDeviceStub(CodeGenFunction &CGF,
   // Generate the function body for noalias stub
   {
     CodeGenFunction NoaliasCGF(CGM);
-    FunctionArgList NoaliasArgs;
-    
-    // Copy argument list
-    for (const auto &Arg : Args) {
-      auto *NewArg = ParmVarDecl::Create(
-          CGM.getContext(), nullptr, Arg->getInnerLocStart(), Arg->getLocation(),
-          Arg->getIdentifier(), Arg->getType(), Arg->getTypeSourceInfo(),
-          Arg->getStorageClass(), nullptr);
-      NoaliasArgs.push_back(NewArg);
-    }
+    FunctionArgList NoaliasArgs = Args;
     
     // Start function generation
     const CGFunctionInfo &FI = CGM.getTypes().arrangeBuiltinFunctionDeclaration(
         CGM.getContext().VoidTy, NoaliasArgs);
-    NoaliasCGF.StartFunction(GlobalDecl(), CGM.getContext().VoidTy, NoaliasStub, FI,
+    NoaliasCGF.StartFunction(GlobalDecl(dyn_cast<FunctionDecl>(CGF.CurFuncDecl)), CGM.getContext().VoidTy, NoaliasStub, FI,
                             NoaliasArgs, SourceLocation(), SourceLocation());
     
     // Generate the same stub logic as the original
@@ -654,21 +645,12 @@ void CGNVCUDARuntime::emitConstDeviceStub(CodeGenFunction &CGF,
   // Generate the function body for const stub
   {
     CodeGenFunction ConstCGF(CGM);
-    FunctionArgList ConstArgs;
-    
-    // Copy argument list
-    for (const auto &Arg : Args) {
-      auto *NewArg = ParmVarDecl::Create(
-          CGM.getContext(), nullptr, Arg->getInnerLocStart(), Arg->getLocation(),
-          Arg->getIdentifier(), Arg->getType(), Arg->getTypeSourceInfo(),
-          Arg->getStorageClass(), nullptr);
-      ConstArgs.push_back(NewArg);
-    }
+    FunctionArgList ConstArgs = Args;
     
     // Start function generation
     const CGFunctionInfo &FI = CGM.getTypes().arrangeBuiltinFunctionDeclaration(
         CGM.getContext().VoidTy, ConstArgs);
-    ConstCGF.StartFunction(GlobalDecl(), CGM.getContext().VoidTy, ConstStub, FI,
+    ConstCGF.StartFunction(GlobalDecl(dyn_cast<FunctionDecl>(CGF.CurFuncDecl)), CGM.getContext().VoidTy, ConstStub, FI,
                           ConstArgs, SourceLocation(), SourceLocation());
     
     // Generate the same stub logic as the original
