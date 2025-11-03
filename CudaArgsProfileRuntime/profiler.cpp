@@ -342,6 +342,9 @@ bool parse_array_type(const std::string& type, std::string& base_type, int& coun
 
 // helper to get scalar values of various types
 json get_scalar_value(const std::string& type, char* data_addr) {
+    // Fixme: the float and double can not be represented exactly when 
+    // write a number to json file. 
+    // eg: 0.00000001 will be writen as 0.000000
     if (type == "int") return *reinterpret_cast<int*>(data_addr);
     if (type == "float") return *reinterpret_cast<float*>(data_addr);
     if (type == "double") return *reinterpret_cast<double*>(data_addr);
