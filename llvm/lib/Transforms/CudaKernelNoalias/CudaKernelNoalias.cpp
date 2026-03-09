@@ -106,6 +106,11 @@ static cl::opt<std::string> CudaNoaliasSelectedOut(
     cl::desc("Write selected noalias parameters to JSON file for host-side"),
     cl::value_desc("filename"), cl::init(""));
 
+static cl::opt<int> CudaNoaliasMinWeight(
+    "noalias-min-weight",
+    cl::desc("Minimum analysis weight threshold for noalias candidates (strictly greater than this value)"),
+    cl::init(0));
+
 // Return true if the given function is a PTX kernel entry
 static bool isKernelFunction(const Function &F) {
   return F.getCallingConv() == CallingConv::PTX_Kernel;
@@ -314,7 +319,7 @@ void CudaKernelNoaliasPass::computeBestSelections(Module &M, ModuleAnalysisManag
       continue;
     }
 
-    // Candidates from analysis (pointer weights > 0), include struct members
+    // Candidates from analysis (pointer weights > threshold), include struct members
     auto AR = FAM.getResult<CudaKernelAnalysis>(F);
     struct Candidate { SmallVector<unsigned,4> Indices; std::string Path; double Weight; };
     std::vector<Candidate> Cands;
@@ -322,7 +327,7 @@ void CudaKernelNoaliasPass::computeBestSelections(Module &M, ModuleAnalysisManag
     for (const auto &Entry : AR.PointerWeights) {
       const ParameterInfo &PI = Entry.first;
       int W = Entry.second;
-      if (W <= 0) continue; else ++Eligible;
+      if (W <= CudaNoaliasMinWeight) continue; else ++Eligible;
       Candidate C;
       C.Indices = PI.Indices;
       C.Path = buildPath(C.Indices);
@@ -331,8 +336,9 @@ void CudaKernelNoaliasPass::computeBestSelections(Module &M, ModuleAnalysisManag
     }
     if (CudaNoaliasDebug) {
       dbgs() << "[CudaKernelNoalias] kernel='" << F.getName()
-             << "' analysis_candidates(pointer_weights>0)=" << Cands.size()
-             << " (total_pointer_entries=" << Eligible << ")\n";
+             << "' analysis_candidates(pointer_weights>" << CudaNoaliasMinWeight
+             << ")=" << Cands.size()
+             << " (eligible_pointer_entries=" << Eligible << ")\n";
     }
     if (Cands.empty()) continue;
 

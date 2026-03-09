@@ -102,6 +102,11 @@ using namespace llvm;
 static cl::opt<bool> CudaConstDebug("cuda-kernel-const-debug",
     cl::desc("Enable debug prints for CudaKernelConst pass"), cl::init(false));
 
+static cl::opt<int> CudaConstMinWeight(
+    "const-min-weight",
+    cl::desc("Minimum analysis weight threshold for const candidates (strictly greater than this value)"),
+    cl::init(0));
+
 // Forward declarations for type inference helpers
 static std::string getScalarTypeString(Type *Ty);
 static Type *findLoadTypeForArgOffset(const DataLayout &DL, Argument *Arg, uint64_t Offset);
@@ -434,7 +439,7 @@ void CudaKernelConstPass::computeBestSelections(Module &M, ModuleAnalysisManager
     if (KP.launches.empty())
       continue;
 
-    // 候选参数来源于分析权重（仅权重大于0的参与）。
+    // 候选参数来源于分析权重（仅权重大于阈值的参与）。
     auto AR = FAM.getResult<CudaKernelAnalysis>(F);
 
     struct CandidateParam { unsigned Index; SmallVector<unsigned, 4> Indices; std::string Path; double Weight; };
@@ -442,7 +447,7 @@ void CudaKernelConstPass::computeBestSelections(Module &M, ModuleAnalysisManager
     for (const auto &Entry : AR.ScalarWeights) {
       const ParameterInfo &PI = Entry.first;
       int Weight = Entry.second;
-      if (Weight <= 0)
+      if (Weight <= CudaConstMinWeight)
         continue;
       unsigned ArgIndex = PI.getArgIndex();
       std::string Path = std::to_string(PI.Indices[0]);
