@@ -102,12 +102,6 @@ using namespace llvm;
 static cl::opt<bool> CudaConstDebug("cuda-kernel-const-debug",
     cl::desc("Enable debug prints for CudaKernelConst pass"), cl::init(false));
 
-// Disable constant propagation for grid/block dimensions (nctaid/ntid)
-static cl::opt<bool> CudaConstNoDims(
-    "cuda-kernel-const-no-dims",
-    cl::desc("Disable constant propagation for grid/block dimensions"),
-    cl::init(false));
-
 // Forward declarations for type inference helpers
 static std::string getScalarTypeString(Type *Ty);
 static Type *findLoadTypeForArgOffset(const DataLayout &DL, Argument *Arg, uint64_t Offset);
@@ -148,19 +142,6 @@ static cl::opt<std::string> CudaConstProfilePath(
 // Return true if the given function is a PTX kernel entry
 static bool isKernelFunction(const Function &F) {
   return F.getCallingConv() == CallingConv::PTX_Kernel;
-}
-
-// Return true if the function contains any NVVM barrier intrinsic calls
-static bool functionHasNvvmBarrier(const Function &F) {
-  for (const Instruction &I : instructions(F)) {
-    if (const auto *CI = dyn_cast<CallBase>(&I)) {
-      const Function *Callee = CI->getCalledFunction();
-      if (!Callee) continue;
-      StringRef Name = Callee->getName();
-      if (Name.starts_with("llvm.nvvm.barrier")) return true;
-    }
-  }
-  return false;
 }
 
 static void collectParamValues(const json::Object &Obj, unsigned ArgIndex,
@@ -464,12 +445,6 @@ void CudaKernelConstPass::computeBestSelections(Module &M, ModuleAnalysisManager
       if (Weight <= 0)
         continue;
       unsigned ArgIndex = PI.getArgIndex();
-      // Optionally skip grid/block dim candidates entirely
-      if (CudaConstNoDims && !PI.Indices.empty() && PI.Indices[0] >= SPECIAL_INDEX_BASE - 5)
-        continue;
-      // Skip dims if function has barrier intrinsics
-      if (!PI.Indices.empty() && PI.Indices[0] >= SPECIAL_INDEX_BASE - 5 && functionHasNvvmBarrier(F))
-        continue;
       std::string Path = std::to_string(PI.Indices[0]);
       for (size_t ii = 1; ii < PI.Indices.size(); ++ii)
         Path += "." + std::to_string(PI.Indices[ii]);
@@ -592,8 +567,8 @@ void CudaKernelConstPass::computeBestSelections(Module &M, ModuleAnalysisManager
     for (size_t i = 0; i < BestSubIdx.size(); ++i) {
       const unsigned ArgIndex = BestSubIdx[i];
       const std::string &Path = [&]() {
-        std::string P = std::to_string(BestSubIndicesPathVec[i][0]);
-        for (size_t ii = 1; ii < BestSubIndicesPathVec[i].size(); ++ii) P += "." + std::to_string(BestSubIndicesPathVec[i][ii]);
+        std::string P = std::to_string((int)BestSubIndicesPathVec[i][0]);
+        for (size_t ii = 1; ii < BestSubIndicesPathVec[i].size(); ++ii) P += "." + std::to_string((int)BestSubIndicesPathVec[i][ii]);
         return P;
       }();
       const std::string &Val = BestValues[i];
@@ -637,8 +612,8 @@ void CudaKernelConstPass::computeBestSelections(Module &M, ModuleAnalysisManager
       for (size_t i = 0; i < BestSubIdx.size(); ++i) {
         if (i) OS << ", ";
         // 重建 path 输出
-        std::string P = std::to_string(BestSubIndicesPathVec[i][0]);
-        for (size_t ii = 1; ii < BestSubIndicesPathVec[i].size(); ++ii) P += "." + std::to_string(BestSubIndicesPathVec[i][ii]);
+        std::string P = std::to_string((int)BestSubIndicesPathVec[i][0]);
+        for (size_t ii = 1; ii < BestSubIndicesPathVec[i].size(); ++ii) P += "." + std::to_string((int)BestSubIndicesPathVec[i][ii]);
         OS << "arg" << BestSubIdx[i] << "(path=" << P << ")=" << BestValues[i]
            << " (single_ratio=" << Selected[i].ratio << ")";
       }
@@ -770,11 +745,6 @@ void CudaKernelConstPass::performConstantPropagation(Function &F,
 
     // Handle special grid/block dim parameters
     if (ArgIndex >= SPECIAL_INDEX_BASE - 5) {
-      // Global disable via CLI
-      if (CudaConstNoDims) continue;
-      // Skip if function contains barrier intrinsics (be conservative)
-      if (functionHasNvvmBarrier(F))
-        continue;
       Type *Ty = Type::getInt32Ty(F.getContext());
       Value *ConstVal = getConstantValue(SP.Value, Ty);
       if (!ConstVal) continue;
@@ -875,7 +845,7 @@ Function *CudaKernelConstPass::cloneKernelWithConstProp(Function &OrigF,
   // Perform constant propagation on the cloned kernel
   performConstantPropagation(*ClonedF, Profile, SPs);
   
-  // Copy ALL existing nvvm.annotations entries for this function (not only kernel)
+  // Copy the existing nvvm.annotations entry so the clone is still a kernel
   Module *M = OrigF.getParent();
   NamedMDNode *NMD = M->getOrInsertNamedMetadata("nvvm.annotations");
   
@@ -884,13 +854,19 @@ Function *CudaKernelConstPass::cloneKernelWithConstProp(Function &OrigF,
     if (MD->getNumOperands() >= 3) {
       if (auto *FMD = mdconst::dyn_extract_or_null<Function>(MD->getOperand(0))) {
         if (FMD == &OrigF) {
-          LLVMContext &Ctx = M->getContext();
-          SmallVector<Metadata*, 4> NewOps;
-          NewOps.push_back(ValueAsMetadata::get(ClonedF));
-          for (unsigned oi = 1, oe = MD->getNumOperands(); oi != oe; ++oi)
-            NewOps.push_back(MD->getOperand(oi));
-          MDNode *NewMD = MDNode::get(Ctx, NewOps);
-          NMD->addOperand(NewMD);
+          if (auto *Str = dyn_cast<MDString>(MD->getOperand(1))) {
+            if (Str->getString() == "kernel") {
+              LLVMContext &Ctx = M->getContext();
+              Metadata *MDVals[] = {
+                ValueAsMetadata::get(ClonedF),
+                MDString::get(Ctx, "kernel"),
+                MD->getOperand(2)
+              };
+              MDNode *NewMD = MDNode::get(Ctx, MDVals);
+              NMD->addOperand(NewMD);
+              break;
+            }
+          }
         }
       }
     }
