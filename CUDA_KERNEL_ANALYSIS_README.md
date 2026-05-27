@@ -2,111 +2,99 @@
 
 ## Overview
 
-CudaKernelAnalysis 是一个针对 CUDA kernel 的 LLVM 分析 pass，用于分析内核参数（包含按值结构体成员）的使用形态与重要性，为后续优化（如常量传播、noalias）提供权重依据与成员路径信息。
+`CudaKernelAnalysis` 是面向 CUDA kernel 的 LLVM 分析 pass，用于给参数路径赋权，供后续 `CudaKernelConst` 与 `CudaKernelNoalias` 选择候选集。
 
-该 pass 的核心是将参数成员唯一地标识为其**顶层参数索引**和从该参数开始的**字节偏移量**。
+当前实现统一使用“参数路径”表示法：
 
-## Features
+- 顶层参数：`[ArgIndex, 0]`
+- 结构体成员：`[ArgIndex, ByteOffset]`
+- CUDA 隐式维度参数：`[SPECIAL_INDEX, 0]`
 
-### 1. CUDA Kernel Identification
-- 通过调用约定 `PTX_Kernel` 或函数属性 `"ptx.kernel"` 识别 CUDA kernel。
-- 自动跳过非 CUDA kernel 函数。
+其中 `ByteOffset` 是相对顶层参数起始地址的字节偏移。
 
-### 2. Unified Parameter Analysis
-统一分析三类：
-- 标量参数（整数/浮点）
-- 指针参数（用于 noalias）
-- 结构体成员（支持按值传递的结构体与嵌套成员）
+## Kernel 识别
 
-成员路径以 `[ArgIndex, ByteOffset]` 的形式表示。例如：`[1, 4]` 表示第 1 个参数（从0计数）的偏移量为 4 字节的成员。
+只分析 CUDA kernel 函数：
 
-### 3. Weight Rules（权重规则）
-- 标量权重（控制流重要性）：
-  - 直接用于 `br`/`switch`：+10
-  - 用于比较且比较结果用于分支：+5
-  - 循环内使用：+3
-  - 作为 `store` 的被存储值：+4
-  - 参与二元（算术/位）运算：+2
-- 指针权重（noalias 潜力）：
-  - 循环内使用：+5
-  - load/store：+3
-  - GEP 指针运算：+2
-  - 循环不变（Loop-invariant）：+2
+- `CallingConv::PTX_Kernel`，或
+- 函数属性包含 `ptx.kernel`
 
-更高的权重代表更值得进行专门化或约束。
+非 kernel 函数直接跳过。
 
-## Implementation Details
+## 分析对象
 
-### 1. Struct(byval) 与指向结构体的指针
-- 对于任何基于指针的访问（无论是普通指针还是 `byval` 参数），分析都会追踪 `getelementptr` (GEP) 指令。
-- **核心逻辑**：通过 `GEP->accumulateConstantOffset()` 计算出每个被访问成员相对于其顶层参数起始地址的**总字节偏移量**。
-- 这种基于偏移量的方法确保了无论结构体在 IR 中如何布局（例如被扁平化），或者 GEP 是基于 `i8` 还是结构体类型，我们都能得到一个稳定且唯一的标识符。
-- 递归处理嵌套结构体：在递归进入下一层结构体时，当前计算出的偏移量会被传递下去，以确保最终叶成员的偏移量是相对于最外层参数的绝对偏移。
+统一覆盖以下对象：
 
-### 2. 直接按值结构体参数（非指针）
-- 若函数签名参数本身是 `struct`（by value），分析会遍历 `extractvalue` 指令。由于 `extractvalue` 直接使用逻辑索引，分析会结合 `DataLayout` 将这些逻辑索引转换为相应的字节偏移量，以保持与基于指针的分析统一。
+1. 顶层标量参数（整型/浮点）
+2. 顶层指针参数
+3. 结构体按值参数（含嵌套成员）
+4. 指针链访问到的结构体成员（按 GEP 常量偏移归一）
+5. CUDA 维度 intrinsic：
+   - `gridDim.{x,y,z}`
+   - `blockDim.{x,y,z}`
 
-### 3. 路径与显示名
-- `ParameterInfo` 保存 `Indices`，其格式为 `[ArgIndex, ByteOffset]`。
-- `getDisplayName()` 用于调试打印，结构体成员以 `name[offset]` 的形式展示。
+## 权重规则（当前实现）
 
-### 4. Debug 输出
-开启 `-debug-only=cuda-kernel-analysis` 可看到：
-- 顶层指针、标量参数的权重。
-- 结构体成员（含 byval）经 GEP/Load 识别并计权的明细，以偏移量（offset）而非索引路径（path）展示。
-- 汇总列表：
-  - Scalar arguments (including struct members)
-  - Pointer arguments (including struct members)
+### Scalar 权重（`analyzeScalarValue`）
 
-示例（`test_const.cu`）：
-```
-CudaKernelAnalysis: Analyzing CUDA kernel function 'fill_runtime'
-  Pointer argument 'x': weight = 9
-  Struct scalar member offset=4: weight = 5
-  Scalar argument 'size': weight = 8
-  Scalar arguments (including struct members):
-    - indexPath=1.4 name='s[4]' weight=5
-    - indexPath=2 name='size' weight=8
-  Pointer arguments (including struct members):
-    - indexPath=0 name='x' weight=9
-CudaKernelAnalysis: Analysis completed for function 'fill_runtime'
-```
+初始值：`1`
 
-## Usage
+叠加规则：
 
-### Run with opt
+- 直接参与 `br/switch`：`+10`
+- 先比较、比较结果再参与分支：`+5`
+- 在循环体内使用：`+3`
+- 作为 `store` 的 value operand：`+4`
+- 参与二元算术/位运算：`+2`
+
+### Pointer 权重（`analyzePointerValue`）
+
+初始值：`1`（当前分支用于放宽候选覆盖）
+
+叠加规则：
+
+- 在循环体内使用：`+5`
+- 参与 `load/store`：`+3`
+- 参与 `GEP` 指针运算：`+2`
+- 对所在循环满足 loop-invariant：`+2`
+
+## 结构体与偏移路径
+
+实现核心是按 `DataLayout` + `accumulateConstantOffset` 计算总字节偏移：
+
+- 对 byval / 指针基访问路径：沿 `GEP -> (bitcast) -> load` 递归追踪
+- 对直接按值 struct：结合 `ExtractValueInst` 的逻辑索引和 `StructLayout` 转换到字节偏移
+
+因此，不同 IR 形态会被统一映射到同一 `[ArgIndex, ByteOffset]` 路径。
+
+## 维度参数建模
+
+Pass 会扫描以下 intrinsic 调用：
+
+- `llvm.nvvm.read.ptx.sreg.nctaid.{x,y,z}`
+- `llvm.nvvm.read.ptx.sreg.ntid.{x,y,z}`
+
+若该 intrinsic 计算得到的权重 `> 0`，会将其累加到 `ScalarWeights`，路径首元素为保留的 `SPECIAL_INDEX_*`。
+
+## 与下游 Pass 的关系
+
+- `CudaKernelConst` 读取 `ScalarWeights`，再叠加 profile 统计做候选子集搜索。
+- `CudaKernelNoalias` 读取 `PointerWeights`，再叠加 profile alias 比例做候选子集搜索。
+- 候选是否进入搜索由下游阈值控制：
+  - `-mllvm -const-min-weight`
+  - `-mllvm -noalias-min-weight`
+
+## 调试
+
+可通过：
+
 ```bash
-./bin/opt -passes='require<cuda-kernel-analysis>' -disable-output input.ll
-# Debug
-./bin/opt -passes='require<cuda-kernel-analysis>' -debug-only=cuda-kernel-analysis -disable-output input.ll
+./bin/opt -passes='require<cuda-kernel-analysis>' \
+  -debug-only=cuda-kernel-analysis -disable-output input.ll
 ```
 
-### Integrate with other passes
-```bash
-# Before transform passes
-./bin/opt -passes='require<cuda-kernel-analysis>,cuda-kernel-const' input.ll
-```
+输出会显示：
 
-## Test Case: `test_const.cu`
-
-```cuda
-struct MyStruct { int a; int value; };
-extern "C" __global__ void fill_runtime(int *x, MyStruct s, int size) {
-  int idx = threadIdx.x + blockIdx.x * blockDim.x;
-  for (int i = idx; i < size; i += gridDim.x * blockDim.x) {
-    x[i] *= s.value;
-  }
-}
-```
-
-- 期望结果：
-  - `x`（指针，参数0）获得较高指针权重。
-  - `s.value`（struct 成员）：`s` 是参数 1，`value` 在 `a` (4字节)之后，所以其偏移量为 4。分析将产生路径 `[1, 4]` 并为其赋权。
-  - `size`（标量，参数2）获得较高标量权重。
-
-这些结果将作为 `CudaKernelConstPass` 候选集合的基础，后者据此在 `kernels[]` 统计中选择最优常量组合并进行克隆与常量替换。
-
-## Notes
-
-1. 依赖 `LoopAnalysis` 以识别循环内使用与不变性。
-2. 通过 `accumulateConstantOffset` 统一处理不同形式的 GEP，无需区分 `i8` 或结构体类型，增强了稳健性。
+- Scalar/Pointer 路径与权重
+- 路径格式（如 `indexPath=1.4`）
+- 维度 intrinsic 的识别与计权情况
