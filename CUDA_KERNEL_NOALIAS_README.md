@@ -12,6 +12,8 @@
    - 嵌套指针访问加 `alias.scope/noalias` 元数据。
 5. host 端运行时检测通过则调 `_noalias` stub，否则走原 stub。
 
+若同时开启 `-fcuda-kernel-const` 与 `-fcuda-kernel-noalias`，noalias pass 还会在已有 `<orig>_const` 的基础上生成 `<orig>_const_noalias`，用于承载“常量传播 + noalias”的组合特化版本。
+
 ## 2. Profile 输入与路径
 
 Pass 读取 JSON `kernels[]`，每次 launch 扁平化为 `path -> aliasFlag`：
@@ -27,6 +29,14 @@ kernel 名优先读取 `device_side_name`，缺失时使用 `name`。
 
 ```bash
 clang++ ... -fcuda-kernel-noalias \
+  -mllvm -cuda-kernel-profile=/path/to/profile.json
+```
+
+联合开启示例：
+
+```bash
+clang++ ... -fcuda-kernel-const -fcuda-kernel-noalias \
+  -mllvm -cuda-kernel-const-profile=/path/to/profile.json \
   -mllvm -cuda-kernel-profile=/path/to/profile.json
 ```
 
@@ -60,6 +70,10 @@ profile 路径优先级：
 ## 5. clone 变换细节
 
 clone 命名：`<orig>_noalias`
+
+联合优化时的组合 clone 命名：`<orig>_const_noalias`
+
+noalias pass 会跳过已经生成的特化版本（`_const`、`_noalias`、`_const_noalias`），避免重复递归克隆；但在处理原始 kernel 时，如果模块中已经存在同名 `<orig>_const`，则额外克隆该 const 版本并对组合 clone 应用同一组选中的 noalias 变换。
 
 ### 5.1 顶层指针
 
@@ -100,12 +114,65 @@ host 端（`CGCUDARuntime.cpp`）读取 `cuda_noalias_selected`，launch 点执�
 1. 构造目标指针集合（selected 路径）
 2. 构造其余指针集合
 3. 调用 `check_ptr_sets(...)`
-4. 返回 true 调 `_noalias` stub；否则调原 stub
+4. 对返回值取反得到 `NoaliasOK`
+5. `NoaliasOK == true` 调 `_noalias` stub；否则调原 stub
 
 这种“在线守卫 + 离线特化”的方式保证语义安全。
 
-## 8. 目前边界
+同时开启 const/noalias 时，host 端会生成四路分流：
+
+```c
+if (ConstOK) {
+  if (NoaliasOK)
+    __device_stub__foo_const_noalias<<<...>>>();
+  else
+    __device_stub__foo_const<<<...>>>();
+} else {
+  if (NoaliasOK)
+    __device_stub__foo_noalias<<<...>>>();
+  else
+    __device_stub__foo<<<...>>>();
+}
+```
+
+其中 `ConstOK = check_const(...)`，`NoaliasOK = !check_ptr_sets(...)`。`check_ptr_sets(...)` 的返回值表示“发现重叠/潜在 alias”，因此需要取反后才表示 noalias 条件成立。
+
+## 8. host/device stub 与符号命名
+
+设备端 kernel clone 与 host 端 stub 均使用相同后缀规则：
+
+- 原始版本：`<orig>`
+- 常量传播版本：`<orig>_const`
+- noalias 版本：`<orig>_noalias`
+- 联合版本：`<orig>_const_noalias`
+
+`CGCUDANV.cpp` 会在生成 CUDA host stub 时额外生成 `_noalias`、`_const` 和 `_const_noalias` stub，并在注册阶段把这些 stub 分别注册到带后缀的 device kernel 名称。注册匹配时 `_const_noalias` 优先于 `_const` 和 `_noalias`，避免组合后缀被误判成单独优化后缀。
+
+## 9. 测试与验证建议
+
+可用 `cuobjdump --dump-elf` 或 `nm` 检查 fatbin/二进制中的 device 符号，确认是否生成了目标 clone。例如联合开启后应能看到：
+
+```text
+<orig>
+<orig>_const
+<orig>_noalias
+<orig>_const_noalias
+```
+
+运行时验证需要加载检测库：
+
+```bash
+LD_PRELOAD=/path/to/CudaArgsCheck/build/libcheckkernel.so ./your_cuda_app
+```
+
+若使用 Nsight Compute 采样实际 kernel，需要注意两点：
+
+- 编译的 `--cuda-gpu-arch` 必须匹配实际 GPU，例如 V100 使用 `sm_70`。
+- 若 ncu 报 `ERR_NVGPUCTRPERM`，说明当前用户没有访问 NVIDIA performance counter 的权限；此时程序仍可运行，但 ncu 无法输出 per-kernel metrics。
+
+## 10. 目前边界
 
 - 子集搜索是指数复杂度，候选过多时编译成本增大。
 - 嵌套路径定位依赖可识别的 IR 访问链。
 - 收益取决于 profile 代表性、命中率与检测开销平衡。
+- 联合优化复用 const/noalias 两个 pass 各自的选择结果，不额外搜索“常量路径与指针路径”的联合最优子集。

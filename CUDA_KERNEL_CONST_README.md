@@ -9,6 +9,8 @@
 3. Pass 克隆 kernel 为 `<orig>_const`，仅在 clone 内进行常量替换。
 4. host 端根据 `cuda_const_selected` 做运行时比较，命中时调用 `_const` stub，否则回退原 stub。
 
+若同时开启 `-fcuda-kernel-const` 与 `-fcuda-kernel-noalias`，当前实现还会生成联合版本 `<orig>_const_noalias`。联合版本的设备端构造方式是：先由 const pass 生成 `<orig>_const`，再由 noalias pass 在 `<orig>_const` 基础上继续克隆并施加 noalias 变换。
+
 ## 2. Profile 输入
 
 Pass 读取 JSON 根下的 `kernels[]`，不依赖旧 `hot_kernels`。
@@ -28,6 +30,14 @@ kernel 名优先使用 `device_side_name`，缺失时使用 `name`。
 ```bash
 clang++ ... -fcuda-kernel-const \
   -mllvm -cuda-kernel-const-profile=/path/to/profile.json
+```
+
+联合开启示例：
+
+```bash
+clang++ ... -fcuda-kernel-const -fcuda-kernel-noalias \
+  -mllvm -cuda-kernel-const-profile=/path/to/profile.json \
+  -mllvm -cuda-kernel-profile=/path/to/profile.json
 ```
 
 可选项：
@@ -60,6 +70,8 @@ profile 路径优先级：
 ## 5. clone 内常量传播范围
 
 clone 命名：`<orig>_const`
+
+联合优化时，还会存在组合 clone：`<orig>_const_noalias`。该 clone 继承 `_const` 中已经完成的常量替换，再叠加 noalias pass 选择出的指针属性或 alias metadata。
 
 支持三类路径：
 
@@ -109,8 +121,36 @@ else
 - 结构体成员实际值按 `indices` 路径从 AST/布局中提取
 - 命中才走 `_const`，否则始终回退原始路径，语义安全
 
-## 8. 目前边界
+同时开启 const/noalias 时，host 端会同时读取 `cuda_const_selected` 与 `cuda_noalias_selected`，并在同一个 kernel launch 处生成四路分流：
+
+```c
+if (ConstOK) {
+  if (NoaliasOK)
+    __device_stub__foo_const_noalias<<<...>>>();
+  else
+    __device_stub__foo_const<<<...>>>();
+} else {
+  if (NoaliasOK)
+    __device_stub__foo_noalias<<<...>>>();
+  else
+    __device_stub__foo<<<...>>>();
+}
+```
+
+其中 `ConstOK` 来自 `check_const(...)`，`NoaliasOK` 来自 `!check_ptr_sets(...)`。也就是说，只有常量条件和指针不重叠条件同时满足时，才会调用 `_const_noalias` 版本。
+
+## 8. 与 noalias 联合优化的设备端顺序
+
+后端 pass 注册顺序为：
+
+1. `CudaKernelConstPass`
+2. `CudaKernelNoaliasPass`
+
+这一顺序是联合优化成立的关键：`CudaKernelConstPass` 先生成 `<orig>_const`；随后 `CudaKernelNoaliasPass` 除了从原函数生成 `<orig>_noalias`，还会检测是否存在 `<orig>_const`，若存在则继续生成 `<orig>_const_noalias`。
+
+## 9. 目前边界
 
 - 候选子集是指数枚举，参数过多时编译开销会上升。
 - 结构体成员常量替换依赖可识别的 IR 访问形态（主要是常量偏移 GEP 链）。
 - 收益高度依赖 profile 的代表性与在线命中率。
+- 联合优化并不重新做“const 与 noalias 的联合候选搜索”，而是复用两个 pass 各自已经选出的候选集合，再在设备端和 host 端组合这些选择。

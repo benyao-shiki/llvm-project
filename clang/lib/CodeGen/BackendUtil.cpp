@@ -1111,21 +1111,22 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
       });
     }
 
+    // Handle CUDA kernel constant propagation optimization. Run this before
+    // noalias so the noalias pass can optionally build _const_noalias clones.
+    if (CodeGenOpts.CudaKernelConst) {
+      PB.registerOptimizerEarlyEPCallback(
+          [&](ModulePassManager &MPM, OptimizationLevel Level,
+              ThinOrFullLTOPhase Phase) {
+            MPM.addPass(CudaKernelConstPass());
+          });
+    }
+
     // Handle CUDA kernel noalias optimization.
     if (CodeGenOpts.CudaKernelNoalias) {
       PB.registerOptimizerEarlyEPCallback(
           [&](ModulePassManager &MPM, OptimizationLevel Level,
               ThinOrFullLTOPhase Phase) {
             MPM.addPass(CudaKernelNoaliasPass());
-          });
-    }
-
-    // Handle CUDA kernel constant propagation optimization.
-    if (CodeGenOpts.CudaKernelConst) {
-      PB.registerOptimizerEarlyEPCallback(
-          [&](ModulePassManager &MPM, OptimizationLevel Level,
-              ThinOrFullLTOPhase Phase) {
-            MPM.addPass(CudaKernelConstPass());
           });
     }
 

@@ -83,6 +83,22 @@ Pass 会扫描以下 intrinsic 调用：
 - 候选是否进入搜索由下游阈值控制：
   - `-mllvm -const-min-weight`
   - `-mllvm -noalias-min-weight`
+- 同时开启 const/noalias 时，下游不会在 analysis pass 中重新计算联合权重；联合版本 `<orig>_const_noalias` 复用两个 pass 各自已经选择出的 scalar/pointer 路径。
+
+## 联合优化中的角色
+
+联合优化的设备端生成顺序为：
+
+1. `CudaKernelConstPass` 根据 `ScalarWeights` 选择常量路径并生成 `<orig>_const`
+2. `CudaKernelNoaliasPass` 根据 `PointerWeights` 选择 noalias 路径并生成 `<orig>_noalias`
+3. 若 `<orig>_const` 已存在，则 noalias pass 继续生成 `<orig>_const_noalias`
+
+因此，`CudaKernelAnalysis` 仍只负责提供两类独立权重：
+
+- `ScalarWeights` 面向常量传播
+- `PointerWeights` 面向 noalias
+
+组合版本不是新的第三类分析结果，而是在代码生成和动态分流阶段把两个独立优化结果组合起来。
 
 ## 调试
 

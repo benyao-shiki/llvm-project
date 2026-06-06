@@ -801,7 +801,14 @@ PreservedAnalyses CudaKernelNoaliasPass::run(Module &M, ModuleAnalysisManager &A
   computeBestSelections(M, AM);
 
   bool Changed = false; std::vector<Function*> Kernels;
-  for (Function &F : M) if (isKernelFunction(F)) Kernels.push_back(&F);
+  for (Function &F : M) {
+    if (!isKernelFunction(F)) continue;
+    StringRef Name = F.getName();
+    if (Name.ends_with("_const") || Name.ends_with("_noalias") ||
+        Name.ends_with("_const_noalias"))
+      continue;
+    Kernels.push_back(&F);
+  }
 
   for (Function *F : Kernels) {
     auto It = SelectedByKernel.find(F->getName().str());
@@ -811,6 +818,19 @@ PreservedAnalyses CudaKernelNoaliasPass::run(Module &M, ModuleAnalysisManager &A
     (void)Clone; Changed = true;
     LLVM_DEBUG(dbgs() << "Cloned kernel " << F->getName() << " to " << Clone->getName()
                       << " with noalias on " << It->second.size() << " selected entries\n");
+
+    std::string ConstName = F->getName().str() + "_const";
+    std::string CombinedName = F->getName().str() + "_const_noalias";
+    if (Function *ConstF = M.getFunction(ConstName)) {
+      if (!M.getFunction(CombinedName)) {
+        Function *Combined = cloneAndApplyNoalias(*ConstF, It->second);
+        (void)Combined; Changed = true;
+        LLVM_DEBUG(dbgs() << "Cloned const kernel " << ConstF->getName()
+                          << " to " << Combined->getName()
+                          << " with noalias on " << It->second.size()
+                          << " selected entries\n");
+      }
+    }
   }
 
   if (!CudaNoaliasSelectedOut.empty()) {

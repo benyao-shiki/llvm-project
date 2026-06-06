@@ -144,6 +144,7 @@ private:
   void emitDeviceStubBodyNew(CodeGenFunction &CGF, FunctionArgList &Args);
   void emitNoaliasDeviceStub(CodeGenFunction &CGF, FunctionArgList &Args);
   void emitConstDeviceStub(CodeGenFunction &CGF, FunctionArgList &Args);
+  void emitConstNoaliasDeviceStub(CodeGenFunction &CGF, FunctionArgList &Args);
   std::string getDeviceSideName(const NamedDecl *ND) override;
 
   void registerDeviceVar(const VarDecl *VD, llvm::GlobalVariable &Var,
@@ -344,6 +345,11 @@ void CGNVCUDARuntime::emitDeviceStub(CodeGenFunction &CGF,
   // Check if we need to generate const propagation version as well
   if (CGM.getCodeGenOpts().CudaKernelConst) {
     emitConstDeviceStub(CGF, Args);
+  }
+
+  if (CGM.getCodeGenOpts().CudaKernelConst &&
+      CGM.getCodeGenOpts().CudaKernelNoalias) {
+    emitConstNoaliasDeviceStub(CGF, Args);
   }
 }
 
@@ -669,6 +675,45 @@ void CGNVCUDARuntime::emitConstDeviceStub(CodeGenFunction &CGF,
   EmittedKernels.push_back({ConstStub, CGF.CurFuncDecl});
 }
 
+void CGNVCUDARuntime::emitConstNoaliasDeviceStub(CodeGenFunction &CGF,
+                                                 FunctionArgList &Args) {
+  std::string BaseStubName = CGM.getMangledName(GlobalDecl(dyn_cast<FunctionDecl>(CGF.CurFuncDecl), KernelReferenceKind::Stub)).str();
+  std::string CombinedStubName = BaseStubName + "_const_noalias";
+
+  llvm::Function *CombinedStub = CGM.getModule().getFunction(CombinedStubName);
+  if (!CombinedStub) {
+    llvm::FunctionType *FT = CGF.CurFn->getFunctionType();
+    CombinedStub = llvm::Function::Create(FT, CGF.CurFn->getLinkage(),
+                                          CombinedStubName, CGM.getModule());
+  }
+
+  CombinedStub->setLinkage(CGF.CurFn->getLinkage());
+  CombinedStub->copyAttributesFrom(CGF.CurFn);
+  KernelHandles[CombinedStub->getName()] = CombinedStub;
+
+  {
+    CodeGenFunction CombinedCGF(CGM);
+    FunctionArgList CombinedArgs = Args;
+    const CGFunctionInfo &FI = CGM.getTypes().arrangeBuiltinFunctionDeclaration(
+        CGM.getContext().VoidTy, CombinedArgs);
+    CombinedCGF.StartFunction(GlobalDecl(dyn_cast<FunctionDecl>(CGF.CurFuncDecl)),
+                              CGM.getContext().VoidTy, CombinedStub, FI,
+                              CombinedArgs, SourceLocation(), SourceLocation());
+
+    if (CudaFeatureEnabled(CGM.getTarget().getSDKVersion(),
+                           CudaFeature::CUDA_USES_NEW_LAUNCH) ||
+        (CGF.getLangOpts().HIP && CGF.getLangOpts().HIPUseNewLaunchAPI) ||
+        (CGF.getLangOpts().OffloadViaLLVM))
+      emitDeviceStubBodyNew(CombinedCGF, CombinedArgs);
+    else
+      emitDeviceStubBodyLegacy(CombinedCGF, CombinedArgs);
+
+    CombinedCGF.FinishFunction();
+  }
+
+  EmittedKernels.push_back({CombinedStub, CGF.CurFuncDecl});
+}
+
 // Replace the original variable Var with the address loaded from variable
 // ManagedVar populated by HIP runtime.
 static void replaceManagedVar(llvm::GlobalVariable *Var,
@@ -754,20 +799,18 @@ llvm::Function *CGNVCUDARuntime::makeRegisterGlobalsFn() {
   for (auto &&I : EmittedKernels) {
     std::string DeviceKernelName = getDeviceSideName(cast<NamedDecl>(I.D));
     
-    // If this is a noalias stub, register it with the noalias device kernel name
-    if (CGM.getCodeGenOpts().CudaKernelNoalias) {
-      std::string StubName = I.Kernel->getName().str();
-      if (StubName.find("_noalias") != std::string::npos) {
-        DeviceKernelName += "_noalias";
-      }
-    }
-    
-    // If this is a const stub, register it with the const device kernel name
-    if (CGM.getCodeGenOpts().CudaKernelConst) {
-      std::string StubName = I.Kernel->getName().str();
-      if (StubName.find("_const") != std::string::npos) {
-        DeviceKernelName += "_const";
-      }
+    std::string StubName = I.Kernel->getName().str();
+    llvm::StringRef StubNameRef(StubName);
+    if (CGM.getCodeGenOpts().CudaKernelConst &&
+        CGM.getCodeGenOpts().CudaKernelNoalias &&
+        StubNameRef.ends_with("_const_noalias")) {
+      DeviceKernelName += "_const_noalias";
+    } else if (CGM.getCodeGenOpts().CudaKernelNoalias &&
+               StubNameRef.ends_with("_noalias")) {
+      DeviceKernelName += "_noalias";
+    } else if (CGM.getCodeGenOpts().CudaKernelConst &&
+               StubNameRef.ends_with("_const")) {
+      DeviceKernelName += "_const";
     }
     
     llvm::Constant *KernelName = makeConstantString(DeviceKernelName);
