@@ -203,7 +203,41 @@ LD_PRELOAD=/home/yaoben/bishe/llvm-project/CudaArgsProfileRuntime/build/libCudaA
 
 运行结束后，输出文件包含逐次记录 `kernels[]` 与汇总结果 `hot_kernels[]`。
 
-## 6. 当前限制
+## 6. 与反馈优化分支的衔接
+
+本分支只负责采样与离线聚合，不直接生成优化版 device kernel，也不生成 host 端动态分流代码。后续反馈优化由 `cudakernel_alias` 分支消费本分支输出的 JSON profile 完成。
+
+整体衔接关系如下：
+
+```mermaid
+flowchart LR
+    A[kernel_profile 分支运行程序] --> B[输出 JSON profile]
+    B --> C[kernels: 逐次 launch 参数事实]
+    B --> D[hot_kernels: 离线聚合摘要]
+    C --> E[CudaKernelConstPass]
+    C --> F[CudaKernelNoaliasPass]
+    E --> G[生成 _const 版本]
+    F --> H[生成 _noalias 版本]
+    G --> I[联合开启时生成 _const_noalias]
+    H --> I
+    I --> J[host 端运行时检测与动态分流]
+```
+
+当前优化分支主要读取 `kernels[]` 中的逐次 launch 记录，而不是仅依赖 `hot_kernels[]` 摘要：
+
+- const 优化消费标量参数、结构体成员标量以及 `grid/block` 维度值。
+- noalias 优化消费指针地址、内存区间、剩余长度以及 alias 标记。
+- 结构体成员路径在优化分支中会按参数索引和字节偏移归一，用于匹配 LLVM IR 中的访问路径。
+- 联合优化复用同一份 profile，不要求采样分支额外输出组合字段。
+
+需要注意的是，`_const`、`_noalias` 和 `_const_noalias` 都不是 profile 分支生成的内容。它们由反馈优化分支在重新编译阶段根据 profile 和 `CudaKernelAnalysis` 权重生成。优化分支还会把最终选择写入或读取如下字段：
+
+- `cuda_const_selected`：const pass 选出的常量路径与目标值。
+- `cuda_noalias_selected`：noalias pass 选出的指针路径。
+
+这些字段属于反馈优化阶段的选择结果，不属于本分支采样 runtime 的原始输出。若只运行 `kernel_profile` 分支，预期输出仍是 `kernels[]` 与 `hot_kernels[]`。
+
+## 7. 当前限制
 
 1. 输出依赖程序正常退出触发 `atexit`；异常终止可能没有完整 profile 文件。
 2. `cudaMemcpy/cudaMemcpyAsync` 已包装但尚未输出拷贝数据。
